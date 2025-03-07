@@ -11,15 +11,15 @@ from typing import TYPE_CHECKING
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
-from ctypes import c_ssize_t, c_int, c_void_p, c_size_t, c_uint64, CFUNCTYPE
+from ctypes import c_ssize_t, c_int, c_void_p, c_size_t, c_uint64, c_char_p, CFUNCTYPE
 
 from ...entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from ...preprocessing.metadata import PreprocessingMetadata
+from multiprocessing.managers import SharedMemoryManager
 
 if TYPE_CHECKING:
     from typing import List, Tuple
     from ...cloudobject import CloudObject
-#     from botocore.response import StreamingBody
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,17 @@ assert libvdb_path, (
 manager = vdb.manager(mode=vdb.OpenMode.Read, path=libvdb_path)
 
 default_acc = 'SRR'
+
+#TODO: Make it wrapper over python shmem
+class CPPSharedMemory:
+    lib = ctypes.cdll.LoadLibrary(libvdb_path)
+
+    def __init__(self, name: str, size: int):
+        self.current = []
+        self.analysis = []
+        self.lib.register_shmem.restype = None
+        self.lib.register_shmem.argtypes = [c_char_p, c_size_t]
+        self.lib.register_shmem(name.encode(), c_size_t(size))
 
 
 class CPPFunctions:
@@ -259,43 +270,50 @@ def temporary_sra():
         yield str(fpath)
 
 
-def download(cloud_object: CloudObject) -> bytes:
+def download(cloud_object: CloudObject, destination: memoryview) -> bytes:
     bucket = cloud_object.path.bucket
     key = cloud_object.path.key
     obj_resp = cloud_object.storage.get_object(Bucket=bucket, Key=key)
     assert obj_resp.get("ResponseMetadata", {}).get("HTTPStatusCode") == 200
     data_stream = obj_resp["Body"]
 
-    CHUNK_SIZE = 655360000
-    content = b""
+    CHUNK_SIZE = 65536
     chunk = data_stream.read(CHUNK_SIZE)
+    idx = 0
     while chunk != b"":
-        content += chunk
+        destination[idx:idx+len(chunk)] = chunk
+        idx += len(chunk)
         chunk = data_stream.read(CHUNK_SIZE)
-        logger.info(f'Next bytes {len(content)}')
+        logger.info(f'Next bytes {len(chunk)}')
     if hasattr(data_stream, "close"):
         data_stream.close()
-
-    return content
-
 
 def preprocess_sra(cloud_object: CloudObject):
     logger.info('Preprocessing sra started')
 
-    functions = CPPFunctions()
-    functions.content = download(cloud_object)
-    functions.aregister()
+    smm = SharedMemoryManager()
+    smm.start()
+
+    shm = smm.SharedMemory(size=cloud_object.size)
+
+    download(cloud_object, shm.buf)
+    csm = CPPSharedMemory(shm.name, shm.size)
+#    functions = CPPFunctions()
+#    functions.content = shm.buf.tobytes()
+#    functions.aregister()
 
     import tqdm
     with temporary_sra() as fpath:
         qc = QuadrupleCursor.from_filepath(fpath)
         total_lines = len(qc)
-        functions.aflush()
+        #functions.aflush()
         for row in tqdm.tqdm(QCRange(qc, total_lines), total=total_lines):
-            functions.aflush()
-    import pprint
-    pprint.pprint(functions.analysis)
-    print(f'Analysis length: {len(functions.analysis)}')
+            #functions.aflush()
+            pass
+    smm.shutdown()
+#    import pprint
+#    pprint.pprint(functions.analysis)
+#    print(f'Analysis length: {len(functions.analysis)}')
     return PreprocessingMetadata(
         metadata=io.BytesIO(b'nempty'),
         attributes={
@@ -317,16 +335,22 @@ class SRASlice(CloudObjectSlice):
         super().__init__(*args, **kwargs)
 
     def get(self) -> list[str]:
-        functions = CPPFunctions()
-        functions.content = download(self.cloud_object)
-        functions.register()
+        smm = SharedMemoryManager()
+        smm.start()
+
+        shm = smm.SharedMemory(size=self.cloud_object.size)
+        download(self.cloud_object, shm.buf)
+        csm = CPPSharedMemory(shm.name, shm.size)
+        #functions = CPPFunctions()
+        #functions.content = download(self.cloud_object)
+        #functions.register()
 
         lines = []
         with temporary_sra() as fpath:
             qc = QuadrupleCursor.from_filepath(fpath)
             for row in QCRange(qc, self.start, self.end):
                 lines.extend(row.lines)
-
+        smm.shutdown()
         return lines
 
 
