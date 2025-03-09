@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CHUNK_SIZE = 1048576
 
 libvdb_path = os.environ.get('NCBI_VDB_SO_PATH')
 assert libvdb_path, (
@@ -277,7 +278,6 @@ def download(cloud_object: CloudObject, destination: memoryview) -> bytes:
     assert obj_resp.get("ResponseMetadata", {}).get("HTTPStatusCode") == 200
     data_stream = obj_resp["Body"]
 
-    CHUNK_SIZE = 65536
     chunk = data_stream.read(CHUNK_SIZE)
     idx = 0
     while chunk != b"":
