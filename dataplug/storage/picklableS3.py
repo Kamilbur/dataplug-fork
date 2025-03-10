@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from contextlib import suppress
-from pathlib import _PosixFlavour, PurePath
+from pathlib import posixpath, PurePath
 from typing import TYPE_CHECKING
 
 import boto3
@@ -268,23 +268,6 @@ class PickleableS3ClientProxy:
         return response
 
 
-class _S3Flavour(_PosixFlavour):
-    is_supported = True
-
-    def parse_parts(self, parts):
-        drv, root, parsed = super().parse_parts(parts)
-        for part in parsed[1:]:
-            if part == "..":
-                index = parsed.index(part)
-                parsed.pop(index - 1)
-                parsed.remove(part)
-        return drv, root, parsed
-
-    def make_uri(self, path):
-        uri = super().make_uri(path)
-        return uri.replace("file:///", "s3://")
-
-
 class S3Path(PurePath):
     """
     PurePath subclass for AWS S3 service.
@@ -292,7 +275,7 @@ class S3Path(PurePath):
     S3 is not a file-system but we can look at it like a POSIX system.
     """
 
-    _flavour = _S3Flavour()
+    parser = posixpath
     __slots__ = ()
 
     @classmethod
@@ -317,7 +300,7 @@ class S3Path(PurePath):
         >> PureS3Path.from_bucket_key(bucket='<bucket>', key='<key>')
         << PureS3Path('/<bucket>/<key>')
         """
-        bucket = cls(cls._flavour.sep, bucket)
+        bucket = cls(cls.parser.sep, bucket)
         if len(bucket.parts) != 2:
             raise ValueError(
                 "bucket argument contains more then one path element: {}".format(bucket)
@@ -344,7 +327,7 @@ class S3Path(PurePath):
         The AWS S3 Key name, or ''
         """
         self._absolute_path_validation()
-        key = self._flavour.sep.join(self.parts[2:])
+        key = self.parser.sep.join(self.parts[2:])
         return key
 
     @property
