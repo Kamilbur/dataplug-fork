@@ -31,15 +31,16 @@ assert libvdb_path, (
     'object in NCBI_VDB_SO_PATH environment variable'
 )
 
-manager = vdb.manager(mode=vdb.OpenMode.Read, path=libvdb_path)
-
 default_acc = 'SRR'
 
 #TODO: Make it wrapper over python shmem
 class CPPSharedMemory:
-    lib = ctypes.cdll.LoadLibrary(libvdb_path)
+    lib = None
 
     def __init__(self, name: str, size: int):
+        if self.lib is None:
+            CPPSharedMemory.lib = ctypes.cdll.LoadLibrary(libvdb_path)
+
         self.current = []
         self.analysis = []
         self.lib.register_shmem.restype = None
@@ -48,7 +49,7 @@ class CPPSharedMemory:
 
 
 class CPPFunctions:
-    lib = ctypes.cdll.LoadLibrary(libvdb_path)
+    lib = None
     pread_t = CFUNCTYPE(
         c_ssize_t,
         c_int,
@@ -72,6 +73,8 @@ class CPPFunctions:
     c_mmap = None
 
     def __init__(self):
+        if self.lib is None:
+            CPPFunctions.lib = ctypes.cdll.LoadLibrary(libvdb_path)
         self.content = None
         self.current = []
         self.analysis = []
@@ -135,6 +138,8 @@ class QuadrupleCursor:
     qual: vdb.VColumn
     name: vdb.VColumn
 
+    manager = None
+
     _column_names = [
         'READ',
         '(INSDC:quality:text:phred_33)QUALITY',
@@ -151,16 +156,18 @@ class QuadrupleCursor:
 
         return cls(read, qual, name)
 
-    @staticmethod
-    def get_table(filepath):
+    @classmethod
+    def get_table(cls, filepath):
+        if cls.manager is None:
+            cls.manager = vdb.manager(mode=vdb.OpenMode.Read, path=libvdb_path)
         try:
-            with manager.OpenDB(filepath) as db:
+            with cls.manager.OpenDB(filepath) as db:
                 return db.OpenTable('SEQUENCE')
         except vdb.vdb_error as e:
             logger.debug(e)
             pass
         try:
-            return manager.OpenTable(filepath)
+            return cls.manager.OpenTable(filepath)
         except vdb.vdb_error as e:
             logger.debug(e)
             pass
