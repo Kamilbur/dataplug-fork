@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
-from ctypes import c_ssize_t, c_int, c_void_p, c_size_t, c_uint64, c_char_p, CFUNCTYPE
+from ctypes import c_ssize_t, c_int, c_void_p, c_size_t, c_uint64, c_char_p, CFUNCTYPE, Structure, pointer, POINTER
 
 from ...entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from ...preprocessing.metadata import PreprocessingMetadata
@@ -33,19 +33,84 @@ assert libvdb_path, (
 
 default_acc = 'SRR'
 
-#TODO: Make it wrapper over python shmem
-class CPPSharedMemory:
-    lib = None
+_ncbi_vdb_mapping = None
 
-    def __init__(self, name: str, size: int):
-        if self.lib is None:
-            CPPSharedMemory.lib = ctypes.cdll.LoadLibrary(libvdb_path)
 
-        self.current = []
-        self.analysis = []
+class ShmInfo(Structure):
+    _fields_ = [
+        ("fd", c_int),
+        ("ptr", c_void_p),
+        ("length", c_size_t),
+    ]
+
+ShmInfo_p = POINTER(ShmInfo)
+
+class NcbiVdbMapping:
+    def __init__(self):
+        self.lib = ctypes.cdll.LoadLibrary(libvdb_path)
         self.lib.register_shmem.restype = None
-        self.lib.register_shmem.argtypes = [c_char_p, c_size_t]
-        self.lib.register_shmem(name.encode(), c_size_t(size))
+        self.lib.register_shmem.argtypes = [ShmInfo_p, c_char_p]
+        
+        self.lib.close_shmem.restype = None
+        self.lib.close_shmem.argtypes = [ShmInfo_p]
+   
+        self._dp_sra_size = c_size_t.in_dll(self.lib, "dp_sra_size")
+
+        self.shm_buf = ShmInfo.in_dll(self.lib, "shm_buf")
+
+    @property
+    def dp_sra_size(self):
+        return self._dp_sra_size.value
+
+    @dp_sra_size.setter
+    def dp_sra_size(self, value: int):
+        self._dp_sra_size.value = value
+
+    def register_shmem(self, shm_p: ShmInfo_p, name: bytes) -> None:
+        self.lib.register_shmem(shm_p, name.encode())
+
+    def close_shmem(self, shm_p: ShmInfo_p) -> None:
+        self.lib.close_shmem(shm_p)
+
+
+def get_ncbi_vdb_mapping():
+    global _ncbi_vdb_mapping 
+    if _ncbi_vdb_mapping is None:
+        _ncbi_vdb_mapping = NcbiVdbMapping()
+    return _ncbi_vdb_mapping
+
+
+class NcbiVdbSharedMemory:
+    def __init__(self, shm_info: ShmInfo, size: int):
+        self.size = size
+        self.shm_info = shm_info
+        self.shared_memory_manager = SharedMemoryManager()
+        self.mapping = get_ncbi_vdb_mapping()
+
+    @property
+    def buf(self):
+        return self.shared_memory.buf
+
+    @property
+    def name(self):
+        return self.shared_memory.name
+
+    def __enter__(self):
+        self._init_shared_memory()
+        self._init_shm_info()
+        return self.shared_memory
+
+    def _init_shared_memory(self):
+        self.shared_memory_manager.start()
+        self.shared_memory = self.shared_memory_manager.SharedMemory(size=self.size)
+
+    def _init_shm_info(self):
+        self.shm_info.length = self.size
+        self.mapping.register_shmem(pointer(self.shm_info), self.name)
+
+    def __exit__(self, type, value, traceback):
+        self.mapping.close_shmem(pointer(self.shm_info))
+        self.shared_memory_manager.shutdown()
 
 
 class CPPFunctions:
@@ -228,12 +293,6 @@ class Quadruple:
     def __str__(self):
         return '\n'.join(self.lines)
 
-#     def __str__(self):
-#         return f'''@{self.acc}.{self.name} length={len(self.read)}
-# {self.read}
-# +{self.acc}.{self.name} length={len(self.read)}
-# {self.qual}'''
-
     @property
     def lines(self) -> List[str]:
         return [
@@ -298,29 +357,16 @@ def download(cloud_object: CloudObject, destination: memoryview) -> bytes:
 def preprocess_sra(cloud_object: CloudObject):
     logger.info('Preprocessing sra started')
 
-    smm = SharedMemoryManager()
-    smm.start()
-
-    shm = smm.SharedMemory(size=cloud_object.size)
-
-    download(cloud_object, shm.buf)
-    csm = CPPSharedMemory(shm.name, shm.size)
-#    functions = CPPFunctions()
-#    functions.content = shm.buf.tobytes()
-#    functions.aregister()
-
+    mapping = get_ncbi_vdb_mapping()
+    mapping.dp_sra_size = cloud_object.size
     import tqdm
-    with temporary_sra() as fpath:
-        qc = QuadrupleCursor.from_filepath(fpath)
-        total_lines = len(qc)
-        #functions.aflush()
-        for row in tqdm.tqdm(QCRange(qc, total_lines), total=total_lines):
-            #functions.aflush()
-            pass
-    smm.shutdown()
-#    import pprint
-#    pprint.pprint(functions.analysis)
-#    print(f'Analysis length: {len(functions.analysis)}')
+    with NcbiVdbSharedMemory(mapping.shm_buf, cloud_object.size) as nvsm:
+        download(cloud_object, nvsm.buf)
+        with temporary_sra() as fpath:
+            qc = QuadrupleCursor.from_filepath(fpath)
+            total_lines = len(qc)
+            for row in tqdm.tqdm(QCRange(qc, total_lines), total=total_lines):
+                pass
     return PreprocessingMetadata(
         metadata=io.BytesIO(b'nempty'),
         attributes={
@@ -342,23 +388,18 @@ class SRASlice(CloudObjectSlice):
         super().__init__(*args, **kwargs)
 
     def get(self) -> list[str]:
-        smm = SharedMemoryManager()
-        smm.start()
+        mapping = get_ncbi_vdb_mapping()
+        mapping.dp_sra_size = self.cloud_object.size
 
-        shm = smm.SharedMemory(size=self.cloud_object.size)
-        download(self.cloud_object, shm.buf)
-        csm = CPPSharedMemory(shm.name, shm.size)
-        #functions = CPPFunctions()
-        #functions.content = download(self.cloud_object)
-        #functions.register()
+        with NcbiVdbSharedMemory(mapping.shm_buf, self.cloud_object.size) as nvsm:
+            download(self.cloud_object, nvsm.buf)
 
-        lines = []
-        with temporary_sra() as fpath:
-            qc = QuadrupleCursor.from_filepath(fpath)
-            for row in QCRange(qc, self.start, self.end):
-                lines.extend(row.lines)
-        smm.shutdown()
-        return lines
+            lines = []
+            with temporary_sra() as fpath:
+                qc = QuadrupleCursor.from_filepath(fpath)
+                for row in QCRange(qc, self.start, self.end):
+                    lines.extend(row.lines)
+            return lines
 
 
 def partition_into_ranges(
