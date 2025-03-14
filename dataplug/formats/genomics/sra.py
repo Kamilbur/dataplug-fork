@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
-from ctypes import c_ssize_t, c_int, c_void_p, c_size_t, c_uint64, c_char_p, CFUNCTYPE, Structure, pointer, POINTER
+from ctypes import c_int, c_void_p, c_size_t, c_char_p, Structure, pointer, POINTER
 
 from ...entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from ...preprocessing.metadata import PreprocessingMetadata
@@ -111,90 +111,6 @@ class NcbiVdbSharedMemory:
     def __exit__(self, type, value, traceback):
         self.mapping.close_shmem(pointer(self.shm_info))
         self.shared_memory_manager.shutdown()
-
-
-class CPPFunctions:
-    lib = None
-    pread_t = CFUNCTYPE(
-        c_ssize_t,
-        c_int,
-        c_void_p,
-        c_size_t,
-        c_size_t
-    )
-    mmap_t = CFUNCTYPE(
-        c_void_p,
-        c_void_p,
-        c_size_t,
-        c_int,
-        c_int,
-        c_int,
-        c_uint64
-    )
-    size_t = CFUNCTYPE(c_uint64)
-
-    c_pread = None
-    c_size = None
-    c_mmap = None
-
-    def __init__(self):
-        if self.lib is None:
-            CPPFunctions.lib = ctypes.cdll.LoadLibrary(libvdb_path)
-        self.content = None
-        self.current = []
-        self.analysis = []
-
-        self._register_types()
-
-    def aflush(self):
-        if self.current:
-            self.analysis.append(self.current)
-        self.current = []
-
-    def apread(self, fd, buf, count, offset):
-        self.current.append([offset, count])
-        return self.pread(fd, buf, count, offset)
-
-    def pread(self, fd, buf, count, offset):
-        if self.content is None:
-            return -1
-        ctypes.memmove(buf, self.content[offset:], count)
-        return count
-
-    def mmap(self, addr, length, prot, flags, fd, offset):
-        return None
-
-    def size(self):
-        return len(self.content)
-
-    def _register_types(self):
-        self.lib.register_s3_pread.restype = None
-        self.lib.register_s3_pread.argtypes = [self.pread_t]
-        self.lib.register_s3_mmap.restype = None
-        self.lib.register_s3_mmap.argtypes = [self.mmap_t]
-
-    def _register(self):
-        self.lib.register_s3_pread(
-            self.c_pread,
-            self.c_size
-        )
-        self.lib.register_s3_mmap(
-            self.c_mmap
-        )
-
-    def aregister(self):
-        self.c_pread = self.pread_t(self.apread)
-        self.c_size = self.size_t(self.size)
-        self.c_mmap = self.mmap_t(self.mmap)
-
-        self._register()
-
-    def register(self):
-        self.c_pread = self.pread_t(self.pread)
-        self.c_size = self.size_t(self.size)
-        self.c_mmap = self.mmap_t(self.mmap)
-
-        self._register()
 
 
 @dataclass
