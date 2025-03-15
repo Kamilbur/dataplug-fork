@@ -3,15 +3,18 @@ from __future__ import annotations
 import io
 import logging
 import os
+import sys
 import ctypes
 import tempfile
+import struct
 import vdb
 
 from typing import TYPE_CHECKING
 from pathlib import Path
 from contextlib import contextmanager
 from dataclasses import dataclass
-from ctypes import c_int, c_void_p, c_size_t, c_char_p, Structure, pointer, POINTER
+from ctypes import c_int, c_uint64, c_void_p, c_size_t, c_char_p, Structure, pointer, POINTER, sizeof
+from collections import defaultdict
 
 from ...entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from ...preprocessing.metadata import PreprocessingMetadata
@@ -24,6 +27,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1048576
+PREAD_BUF_SIZE = 100 * sizeof(c_uint64)
+MMAP_BUF_SIZE = 100 * sizeof(c_uint64)
 
 libvdb_path = os.environ.get('NCBI_VDB_SO_PATH')
 assert libvdb_path, (
@@ -32,6 +37,16 @@ assert libvdb_path, (
 )
 
 default_acc = 'SRR'
+
+
+_endianness = '<' if sys.byteorder == 'little' else '>'
+_uint64_t_fmt = _endianness + 'Q'
+_size_t_fmt = _endianness
+if sys.maxsize < 2**32:
+    _size_t_fmt += 'I'
+else:
+    _size_t_fmt += 'Q'
+
 
 _ncbi_vdb_mapping = None
 
@@ -43,20 +58,24 @@ class ShmInfo(Structure):
         ("length", c_size_t),
     ]
 
+
 ShmInfo_p = POINTER(ShmInfo)
+
 
 class NcbiVdbMapping:
     def __init__(self):
         self.lib = ctypes.cdll.LoadLibrary(libvdb_path)
         self.lib.register_shmem.restype = None
         self.lib.register_shmem.argtypes = [ShmInfo_p, c_char_p]
-        
+
         self.lib.close_shmem.restype = None
         self.lib.close_shmem.argtypes = [ShmInfo_p]
-   
+
         self._dp_sra_size = c_size_t.in_dll(self.lib, "dp_sra_size")
 
         self.shm_buf = ShmInfo.in_dll(self.lib, "shm_buf")
+        self.mmap_buf = ShmInfo.in_dll(self.lib, "mmap_buf")
+        self.pread_buf = ShmInfo.in_dll(self.lib, "pread_buf")
 
     @property
     def dp_sra_size(self):
@@ -74,7 +93,7 @@ class NcbiVdbMapping:
 
 
 def get_ncbi_vdb_mapping():
-    global _ncbi_vdb_mapping 
+    global _ncbi_vdb_mapping
     if _ncbi_vdb_mapping is None:
         _ncbi_vdb_mapping = NcbiVdbMapping()
     return _ncbi_vdb_mapping
@@ -235,14 +254,6 @@ class Quadruple:
         return f'{self.qual}'
 
 
-def fasterq_dump(filepath):
-    c = QuadrupleCursor.from_filepath(filepath)
-
-    for q in QCRange(c, 12):
-        pass
-        print(q)
-
-
 @contextmanager
 def temporary_sra():
     with tempfile.TemporaryDirectory() as dpath:
@@ -270,23 +281,100 @@ def download(cloud_object: CloudObject, destination: memoryview) -> bytes:
     if hasattr(data_stream, "close"):
         data_stream.close()
 
+
+def unpack_from(buf, pos, size=sizeof(c_uint64), fmt=_uint64_t_fmt):
+    return struct.unpack(fmt, buf[pos:pos + size])[0]
+
+
+def pack_to(buf, pos, val, fmt=_uint64_t_fmt):
+    buf[pos:pos + sizeof(c_size_t)] = struct.pack(fmt, val)
+
+
+def ibuf_to_list(buf, length):
+    retval = []
+
+    idx = 0
+    for i in range(length // 2):
+        pos = unpack_from(buf, idx)
+        size = unpack_from(
+            buf,
+            idx + sizeof(c_uint64),
+            size=sizeof(c_size_t),
+            fmt=_size_t_fmt
+        )
+        # Additional 4 bytes for compression purposes
+        retval.append((pos, pos + size + 4))
+        idx += sizeof(c_uint64) + sizeof(c_size_t)
+
+    return retval
+
+
+def sum_intervals(intervals):
+    heights = defaultdict(lambda: 0)
+    for tup in intervals:
+        heights[tup[0]] += 1
+        heights[tup[1]] -= 1
+
+    retval = []
+    height = 0
+    left = min(heights.keys())
+    for end in sorted(heights.keys()):
+        height += heights[end]
+        if left is None:
+            left = end
+        if height == 0:
+            retval.append((left, end))
+            left = None
+    return retval
+
+
+def save_mmaps(mmaps, buf):
+    nmmaps = unpack_from(buf, 0)
+    if nmmaps == 0:
+        return
+    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * nmmaps)
+    mmaps.extend(tuples)
+    pack_to(buf, 0, 0)
+
+
+def save_preads(preads, buf, idx):
+    npreads = unpack_from(buf, 0)
+    if npreads == 0:
+        return
+    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * npreads)
+    preads[idx] = tuples
+    pack_to(buf, 0, 0)
+
+
 def preprocess_sra(cloud_object: CloudObject):
     logger.info('Preprocessing sra started')
 
     mapping = get_ncbi_vdb_mapping()
     mapping.dp_sra_size = cloud_object.size
     import tqdm
-    with NcbiVdbSharedMemory(mapping.shm_buf, cloud_object.size) as nvsm:
+
+    mmaps, preads = [], {}
+    with (NcbiVdbSharedMemory(mapping.shm_buf, cloud_object.size) as nvsm,
+          NcbiVdbSharedMemory(mapping.mmap_buf, MMAP_BUF_SIZE) as mmapsm,
+          NcbiVdbSharedMemory(mapping.pread_buf, PREAD_BUF_SIZE) as prsm):
         download(cloud_object, nvsm.buf)
         with temporary_sra() as fpath:
             qc = QuadrupleCursor.from_filepath(fpath)
             total_lines = len(qc)
-            for row in tqdm.tqdm(QCRange(qc, total_lines), total=total_lines):
-                pass
+            save_mmaps(mmaps, mmapsm.buf)
+            save_preads(preads, prsm.buf, -1)
+            for i, row in tqdm.tqdm(enumerate(QCRange(qc, total_lines)), total=total_lines):
+                save_mmaps(mmaps, mmapsm.buf)
+                save_preads(preads, prsm.buf, i)
+
+    mmaps = sum_intervals(mmaps)
+    preads[-1] = sum_intervals(preads[-1])
     return PreprocessingMetadata(
         metadata=io.BytesIO(b'nempty'),
         attributes={
             'total_lines': total_lines,
+            'mmaps': mmaps,
+            'preads': preads,
         }
     )
 
@@ -298,9 +386,11 @@ class SRA:
 
 
 class SRASlice(CloudObjectSlice):
-    def __init__(self, start, end, *args, **kwargs):
+    def __init__(self, start, end, mmaps, preads, *args, **kwargs):
         self.start = start
         self.end = end
+        self.mmaps = mmaps
+        self.preads = preads
         super().__init__(*args, **kwargs)
 
     def get(self) -> list[str]:
@@ -349,6 +439,22 @@ def partition_into_ranges(
     return firsts + seconds
 
 
+def generate_slices(mmaps, preads, ranges):
+    global_preads = preads[-1]
+    del preads[-1]
+    idx = 0
+    slices = []
+    local_preads = global_preads.copy()
+    for line in sorted(preads.keys()):
+        if line >= ranges[idx][1]:
+            slices.append(SRASlice(*ranges[idx], mmaps, sum_intervals(local_preads)))
+            local_preads = global_preads.copy()
+            idx += 1
+        local_preads += preads[line]
+    slices.append(SRASlice(*ranges[idx], mmaps, sum_intervals(local_preads)))
+    return slices
+
+
 @PartitioningStrategy(dataformat=SRA)
 def partition_chunks_strategy(
     cloud_object: CloudObject,
@@ -356,5 +462,9 @@ def partition_chunks_strategy(
 ) -> List[SRASlice]:
     logger.info('SRA partitioning started')
     total_lines = int(cloud_object.get_attribute("total_lines"))
+    mmaps = cloud_object.get_attribute("mmaps")
+    preads = cloud_object.get_attribute("preads")
+
     ranges = partition_into_ranges(total_lines, num_chunks)
-    return [SRASlice(*range) for range in ranges]
+
+    return generate_slices(mmaps, preads, ranges)
