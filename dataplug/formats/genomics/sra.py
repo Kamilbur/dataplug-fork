@@ -72,6 +72,7 @@ class NcbiVdbMapping:
         self.lib.close_shmem.argtypes = [ShmInfo_p]
 
         self._dp_sra_size = c_size_t.in_dll(self.lib, "dp_sra_size")
+        self._dp_mode = c_int.in_dll(self.lib, "dp_mode")
 
         self.shm_buf = ShmInfo.in_dll(self.lib, "shm_buf")
         self.mmap_buf = ShmInfo.in_dll(self.lib, "mmap_buf")
@@ -84,6 +85,14 @@ class NcbiVdbMapping:
     @dp_sra_size.setter
     def dp_sra_size(self, value: int):
         self._dp_sra_size.value = value
+
+    @property
+    def dp_mode(self):
+        return self._dp_mode.value
+
+    @dp_mode.setter
+    def dp_mode(self, value: int):
+        self._dp_mode.value = value
 
     def register_shmem(self, shm_p: ShmInfo_p, name: bytes) -> None:
         self.lib.register_shmem(shm_p, name.encode())
@@ -286,11 +295,11 @@ def unpack_from(buf, pos, size=sizeof(c_uint64), fmt=_uint64_t_fmt):
     return struct.unpack(fmt, buf[pos:pos + size])[0]
 
 
-def pack_to(buf, pos, val, fmt=_uint64_t_fmt):
-    buf[pos:pos + sizeof(c_size_t)] = struct.pack(fmt, val)
+def pack_to(buf, pos, val, size=sizeof(c_uint64), fmt=_uint64_t_fmt):
+    buf[pos:pos + size] = struct.pack(fmt, val)
 
 
-def ibuf_to_list(buf, length):
+def ibuf_to_list(buf, length, total_size):
     retval = []
 
     idx = 0
@@ -302,8 +311,10 @@ def ibuf_to_list(buf, length):
             size=sizeof(c_size_t),
             fmt=_size_t_fmt
         )
-        # Additional 4 bytes for compression purposes
-        retval.append((pos, pos + size + 4))
+        # Additional 4 bytes for alignment purposes
+        if pos + size + 4 < total_size:
+            size += 4
+        retval.append((pos, pos + size))
         idx += sizeof(c_uint64) + sizeof(c_size_t)
 
     return retval
@@ -328,20 +339,20 @@ def sum_intervals(intervals):
     return retval
 
 
-def save_mmaps(mmaps, buf):
+def save_mmaps(mmaps, buf, total_size):
     nmmaps = unpack_from(buf, 0)
     if nmmaps == 0:
         return
-    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * nmmaps)
+    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * nmmaps, total_size)
     mmaps.extend(tuples)
     pack_to(buf, 0, 0)
 
 
-def save_preads(preads, buf, idx):
+def save_preads(preads, buf, idx, total_size):
     npreads = unpack_from(buf, 0)
     if npreads == 0:
         return
-    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * npreads)
+    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * npreads, total_size)
     preads[idx] = tuples
     pack_to(buf, 0, 0)
 
@@ -361,11 +372,11 @@ def preprocess_sra(cloud_object: CloudObject):
         with temporary_sra() as fpath:
             qc = QuadrupleCursor.from_filepath(fpath)
             total_lines = len(qc)
-            save_mmaps(mmaps, mmapsm.buf)
-            save_preads(preads, prsm.buf, -1)
+            save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
+            save_preads(preads, prsm.buf, -1, cloud_object.size)
             for i, row in tqdm.tqdm(enumerate(QCRange(qc, total_lines)), total=total_lines):
-                save_mmaps(mmaps, mmapsm.buf)
-                save_preads(preads, prsm.buf, i)
+                save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
+                save_preads(preads, prsm.buf, i, cloud_object.size)
 
     mmaps = sum_intervals(mmaps)
     preads[-1] = sum_intervals(preads[-1])
@@ -393,12 +404,66 @@ class SRASlice(CloudObjectSlice):
         self.preads = preads
         super().__init__(*args, **kwargs)
 
-    def get(self) -> list[str]:
+    def partial_download(self):
+
+        def prefetch(nvsm, mmapsm, prsm):
+            nvms_buf_idx = 0
+            mmap_buf_idx = 0
+            dsize = sizeof(c_uint64)
+            pack_to(mmapsm.buf, 0, len(self.mmaps))
+            mmap_buf_idx += dsize
+            for left, right in self.mmaps:
+                length = right - left
+                nvsm.buf[nvms_buf_idx:nvms_buf_idx + length] = self.download_range(left, right - 1)
+                pack_to(mmapsm.buf, mmap_buf_idx, nvms_buf_idx)
+                mmap_buf_idx += dsize
+                pack_to(mmapsm.buf, mmap_buf_idx, left)
+                mmap_buf_idx += dsize
+                pack_to(mmapsm.buf, mmap_buf_idx, right)
+                mmap_buf_idx += dsize
+                nvms_buf_idx += length
+
+            pread_buf_idx = 0
+            pack_to(prsm.buf, 0, len(self.preads))
+            pread_buf_idx += dsize
+            for left, right in self.preads:
+                length = right - left
+                nvsm.buf[nvms_buf_idx:nvms_buf_idx + length] = self.download_range(left, right - 1)
+                pack_to(prsm.buf, pread_buf_idx, nvms_buf_idx)
+                pread_buf_idx += dsize
+                pack_to(prsm.buf, pread_buf_idx, left)
+                pread_buf_idx += dsize
+                pack_to(prsm.buf, pread_buf_idx, right)
+                pread_buf_idx += dsize
+                nvms_buf_idx += length
+
+        return self.decompress(
+            dp_mode=1,
+            total_length=self.sum_lengths(self.mmaps) + self.sum_lengths(self.preads),
+            prefetch=prefetch
+        )
+
+
+    def full_download(self):
+
+        def prefetch(nvsm, mmapsm, prsm):
+            download(self.cloud_object, nvsm.buf)
+
+        return self.decompress(
+            dp_mode=0,
+            total_length=self.cloud_object.size,
+            prefetch=prefetch
+        )
+
+    def decompress(self, dp_mode, total_length, prefetch):
         mapping = get_ncbi_vdb_mapping()
         mapping.dp_sra_size = self.cloud_object.size
+        mapping.dp_mode = dp_mode
+        with (NcbiVdbSharedMemory(mapping.shm_buf, total_length) as nvsm,
+              NcbiVdbSharedMemory(mapping.mmap_buf, MMAP_BUF_SIZE) as mmapsm,
+              NcbiVdbSharedMemory(mapping.pread_buf, PREAD_BUF_SIZE) as prsm):
 
-        with NcbiVdbSharedMemory(mapping.shm_buf, self.cloud_object.size) as nvsm:
-            download(self.cloud_object, nvsm.buf)
+            prefetch(nvsm, mmapsm, prsm)
 
             lines = []
             with temporary_sra() as fpath:
@@ -406,6 +471,26 @@ class SRASlice(CloudObjectSlice):
                 for row in QCRange(qc, self.start, self.end):
                     lines.extend(row.lines)
             return lines
+
+    def get(self) -> list[str]:
+        return self.partial_download()
+
+
+    @staticmethod
+    def sum_lengths(iterable):
+        length = 0
+        for left, right in iterable:
+            length += right - left
+
+        return length
+
+    def download_range(self, left, right):
+        res = self.cloud_object.storage.get_object(
+            Bucket=self.cloud_object.path.bucket,
+            Key=self.cloud_object.path.key,
+            Range=f"bytes={left}-{right}",
+        )
+        return res['Body'].read()
 
 
 def partition_into_ranges(
@@ -440,17 +525,19 @@ def partition_into_ranges(
 
 
 def generate_slices(mmaps, preads, ranges):
-    global_preads = preads[-1]
+    global_preads = preads[-1] + preads[0]
     del preads[-1]
     idx = 0
     slices = []
     local_preads = global_preads.copy()
+    prev = None
     for line in sorted(preads.keys()):
         if line >= ranges[idx][1]:
             slices.append(SRASlice(*ranges[idx], mmaps, sum_intervals(local_preads)))
-            local_preads = global_preads.copy()
+            local_preads = global_preads.copy() + preads[prev]
             idx += 1
         local_preads += preads[line]
+        prev = line
     slices.append(SRASlice(*ranges[idx], mmaps, sum_intervals(local_preads)))
     return slices
 
