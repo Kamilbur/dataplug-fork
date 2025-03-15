@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import json
 import logging
 import time
@@ -14,6 +15,11 @@ import botocore.client
 if TYPE_CHECKING:
     from typing import Optional
     from mypy_boto3_s3.type_defs import DeleteObjectOutputTypeDef, DeleteObjectsOutputTypeDef
+
+try:
+    from pathlib import _PosixFlavour
+except ImportError as _:
+    _PosixFlavour = object
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +274,23 @@ class PickleableS3ClientProxy:
         return response
 
 
+class _S3Flavour(_PosixFlavour):
+    is_supported = True
+
+    def parse_parts(self, parts):
+        drv, root, parsed = super().parse_parts(parts)
+        for part in parsed[1:]:
+            if part == "..":
+                index = parsed.index(part)
+                parsed.pop(index - 1)
+                parsed.remove(part)
+        return drv, root, parsed
+
+    def make_uri(self, path):
+        uri = super().make_uri(path)
+        return uri.replace("file:///", "s3://")
+
+
 class S3Path(PurePath):
     """
     PurePath subclass for AWS S3 service.
@@ -353,3 +376,6 @@ class S3Path(PurePath):
         return "{}(bucket={},key={})".format(
             self.__class__.__name__, self.bucket, self.key
         )
+
+if sys.version_info < (3, 12):
+    S3Path._flavour = _S3Flavour()
