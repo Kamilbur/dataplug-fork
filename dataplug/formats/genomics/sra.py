@@ -8,6 +8,7 @@ import ctypes
 import tempfile
 import struct
 import vdb
+import tqdm
 
 from typing import TYPE_CHECKING
 from pathlib import Path
@@ -208,6 +209,14 @@ class QCRange:
         self.current = start
         self.acc = acc
 
+    def __len__(self):
+        if self.step > 0 and self.start < self.stop:
+            return 1 + (self.stop - 1 - self.start) // self.step
+        elif sefl.step < 0 and self.start < self.stop:
+            return 1 + (self.start - 1 - self.stop) // (0 - self.step)
+        else:
+            return 0
+
     def __iter__(self):
         return self
 
@@ -362,7 +371,6 @@ def preprocess_sra(cloud_object: CloudObject):
 
     mapping = get_ncbi_vdb_mapping()
     mapping.dp_sra_size = cloud_object.size
-    import tqdm
 
     mmaps, preads = [], {}
     with (NcbiVdbSharedMemory(mapping.shm_buf, cloud_object.size) as nvsm,
@@ -437,7 +445,7 @@ class SRASlice(CloudObjectSlice):
                 pread_buf_idx += dsize
                 nvms_buf_idx += length
 
-        return self.decompress(
+        yield from self.decompress(
             dp_mode=1,
             total_length=self.sum_lengths(self.mmaps) + self.sum_lengths(self.preads),
             prefetch=prefetch
@@ -449,7 +457,7 @@ class SRASlice(CloudObjectSlice):
         def prefetch(nvsm, mmapsm, prsm):
             download(self.cloud_object, nvsm.buf)
 
-        return self.decompress(
+        yield from self.decompress(
             dp_mode=0,
             total_length=self.cloud_object.size,
             prefetch=prefetch
@@ -464,17 +472,17 @@ class SRASlice(CloudObjectSlice):
               NcbiVdbSharedMemory(mapping.pread_buf, PREAD_BUF_SIZE) as prsm):
 
             prefetch(nvsm, mmapsm, prsm)
-
-            lines = []
             with temporary_sra() as fpath:
                 qc = QuadrupleCursor.from_filepath(fpath)
                 for row in QCRange(qc, self.start, self.end):
-                    lines.extend(row.lines)
-            return lines
+                    for line in row.lines:
+                        yield line
 
     def get(self) -> list[str]:
-        return self.partial_download()
+        return list(self.partial_download())
 
+    def lazy_get(self):
+        yield from self.partial_download()
 
     @staticmethod
     def sum_lengths(iterable):

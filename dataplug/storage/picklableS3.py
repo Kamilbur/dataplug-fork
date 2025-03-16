@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import json
 import logging
@@ -379,3 +380,5 @@ class S3Path(PurePath):
 
 if sys.version_info < (3, 12):
     S3Path._flavour = _S3Flavour()
+# else:
+#     os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'WHEN_REQUIRED'
