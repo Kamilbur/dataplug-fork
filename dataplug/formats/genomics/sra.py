@@ -31,11 +31,13 @@ CHUNK_SIZE = 1048576
 PREAD_BUF_SIZE = 100 * sizeof(c_uint64)
 MMAP_BUF_SIZE = 100 * sizeof(c_uint64)
 
-libvdb_path = os.environ.get('NCBI_VDB_SO_PATH')
-assert libvdb_path, (
-    'Provide path to ncbi-vdb shared '
-    'object in NCBI_VDB_SO_PATH environment variable'
-)
+libvdb_path = os.environ.get('NCBI_VDB_SO_PATH', '')
+
+if not libvdb_path:
+    logger.warn(
+        'For complete functionality of SRA backend provide path'
+        'to ncbi-vdb shared object in NCBI_VDB_SO_PATH environment variable.'
+    )
 
 default_acc = 'SRR'
 
@@ -66,18 +68,24 @@ ShmInfo_p = POINTER(ShmInfo)
 class NcbiVdbMapping:
     def __init__(self):
         self.lib = ctypes.cdll.LoadLibrary(libvdb_path)
-        self.lib.register_shmem.restype = None
-        self.lib.register_shmem.argtypes = [ShmInfo_p, c_char_p]
-
-        self.lib.close_shmem.restype = None
-        self.lib.close_shmem.argtypes = [ShmInfo_p]
-
-        self._dp_sra_size = c_size_t.in_dll(self.lib, "dp_sra_size")
-        self._dp_mode = c_int.in_dll(self.lib, "dp_mode")
-
-        self.shm_buf = ShmInfo.in_dll(self.lib, "shm_buf")
-        self.mmap_buf = ShmInfo.in_dll(self.lib, "mmap_buf")
-        self.pread_buf = ShmInfo.in_dll(self.lib, "pread_buf")
+        try:
+            self.lib.register_shmem.restype = None
+            self.lib.register_shmem.argtypes = [ShmInfo_p, c_char_p]
+    
+            self.lib.close_shmem.restype = None
+            self.lib.close_shmem.argtypes = [ShmInfo_p]
+    
+            self._dp_sra_size = c_size_t.in_dll(self.lib, "dp_sra_size")
+            self._dp_mode = c_int.in_dll(self.lib, "dp_mode")
+    
+            self.shm_buf = ShmInfo.in_dll(self.lib, "shm_buf")
+            self.mmap_buf = ShmInfo.in_dll(self.lib, "mmap_buf")
+            self.pread_buf = ShmInfo.in_dll(self.lib, "pread_buf")
+        except AttributeError as e:
+            raise AttributeError(
+                f'Probably NCBI_VDB_SO_PATH environment variable is not set.\n'
+                f'[{str(e)}]'
+            )
 
     @property
     def dp_sra_size(self):
