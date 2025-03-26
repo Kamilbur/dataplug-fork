@@ -31,11 +31,13 @@ CHUNK_SIZE = 1048576
 PREAD_BUF_SIZE = 100 * sizeof(c_uint64)
 MMAP_BUF_SIZE = 100 * sizeof(c_uint64)
 
-libvdb_path = os.environ.get('NCBI_VDB_SO_PATH')
-assert libvdb_path, (
-    'Provide path to ncbi-vdb shared '
-    'object in NCBI_VDB_SO_PATH environment variable'
-)
+libvdb_path = os.environ.get('NCBI_VDB_SO_PATH', '')
+
+if not libvdb_path:
+    logger.warn(
+        'For complete functionality of SRA backend provide path'
+        'to ncbi-vdb shared object in NCBI_VDB_SO_PATH environment variable.'
+    )
 
 default_acc = 'SRR'
 
