@@ -413,7 +413,7 @@ def save_preads(preads, buf, idx, total_size):
     pack_to(buf, 0, 0)
 
 
-def preprocess_sra(cloud_object: CloudObject):
+def preprocess_sra(cloud_object: CloudObject, step=250):
     logger.info('Preprocessing sra started')
 
     mapping = get_ncbi_vdb_mapping()
@@ -429,9 +429,20 @@ def preprocess_sra(cloud_object: CloudObject):
             total_lines = len(qc)
             save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
             save_preads(preads, prsm.buf, -1, cloud_object.size)
-            for i, row in tqdm.tqdm(enumerate(QCRange(qc, total_lines)), total=total_lines):
+            for i, row in tqdm.tqdm(enumerate(QCRange(qc, total_lines, step=step)), total=total_lines // step):
                 save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
-                save_preads(preads, prsm.buf, i, cloud_object.size)
+                save_preads(preads, prsm.buf, i * step, cloud_object.size)
+#    from collections import defaultdict
+#    lens = defaultdict(lambda: 0)
+#    kys = sorted(list(preads.keys()))
+#    print('Minimum:', min([kys[i+1] - kys[i] for i in range(1, len(kys) - 1)]))
+#
+#    nflat = [preads[k] for k in preads]
+#    eman = [el for nel in nflat for el in nel]
+#    print(sum_intervals(eman))
+#
+#    #import sys
+#    #sys.exit(0)
 
     mmaps = sum_intervals(mmaps)
     preads[-1] = sum_intervals(preads[-1])
