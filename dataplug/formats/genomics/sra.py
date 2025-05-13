@@ -202,12 +202,51 @@ class QuadrupleCursor:
 
 
 class QCRange:
+    """
+    QCRange provides an iterable range over a QuadrupleCursor object, similar to Python's built-in range.
+
+    Parameters
+    ----------
+    cursor : QuadrupleCursor
+        The cursor object over which the range is defined.
+    start : int, optional
+        The starting index of the range. Defaults to 0.
+    stop : int, optional
+        The stopping index (exclusive) of the range. Defaults to len(cursor) if not provided.
+    step : int, optional
+        The step size between elements. Defaults to 1.
+
+    Notes
+    -----
+    - If `start` and `stop` are not explicitly provided, QCRange defaults to [0, len(cursor)),
+      treating the range as spanning the entire cursor.
+    - The behavior of QCRange otherwise mimics that of Python's built-in range: it is right-exclusive,
+      supports positive and negative steps, and raises a ValueError if `step=0`.
+    - This class requires the `cursor` to implement `__len__` to determine the default stop value.
+
+    Examples
+    --------
+    Iterate over the entire cursor:
+        >>> for row in QCRange(cursor):
+        >>>     process(row)
+
+    Iterate over a subset of the cursor:
+        >>> for row in QCRange(cursor, start=10, stop=20, step=2):
+        >>>     process(row)
+
+    Iterate over first 20 elements of the cursor:
+        >>> for row in QCRange(cursor, 20):
+        >>>     process(row)
+    """
+
     def __init__(self, cursor, start=None, stop=None, step=1, acc=default_acc):
-        if start is None:
+        if start is None and stop is None:
             start = len(cursor)
         if stop is None:
             start, stop = 0, start
 
+        if step == 0:
+            raise ValueError('QCRange() step argument must not be zero')
         start += 1
         stop += 1
         self.cursor = cursor
