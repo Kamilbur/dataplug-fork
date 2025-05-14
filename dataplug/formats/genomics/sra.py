@@ -588,6 +588,7 @@ def generate_slices(mmaps, preads, ranges):
     prev = None
     for line in sorted(preads.keys()):
         if line >= ranges[idx][1]:
+            local_preads += preads[line]
             slices.append(SRASlice(*ranges[idx], mmaps, sum_intervals(local_preads)))
             local_preads = global_preads.copy() + preads[prev]
             idx += 1
