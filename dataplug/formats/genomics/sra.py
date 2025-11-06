@@ -7,7 +7,7 @@ import sys
 import ctypes
 import tempfile
 import struct
-import vdb
+import importlib
 import tqdm
 
 from typing import TYPE_CHECKING
@@ -32,6 +32,7 @@ PREAD_BUF_SIZE = 100 * sizeof(c_uint64)
 MMAP_BUF_SIZE = 100 * sizeof(c_uint64)
 
 libvdb_path = os.environ.get('NCBI_VDB_SO_PATH', '')
+libvdb_python_path = 'LIBVDB_PYTHON_DIR'
 
 if not libvdb_path:
     logger.warn(
@@ -52,6 +53,24 @@ else:
 
 
 _ncbi_vdb_mapping = None
+
+
+def _import_lib(libname, libpath=''):
+    try:
+        return importlib.import_module(libname)
+    except ImportError:
+        d = os.getenv(libpath)
+        if d and d not in sys.path:
+            sys.path.insert(0, d)
+            return importlib.import_module(libname)
+        raise RuntimeError(
+            "SRA format needs python bindings for vdb library."
+            "Either install it or set "
+            f"{libpath}=/path/to/build and retry."
+        )
+
+vdb = _import_lib('vdb', libvdb_python_path)
+
 
 
 class ShmInfo(Structure):
