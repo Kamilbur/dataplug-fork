@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import logging
+import os
+import struct
+import sys
 from ctypes import (
     POINTER,
     Structure,
@@ -12,11 +16,7 @@ from ctypes import (
     pointer,
     sizeof,
 )
-import logging
 from multiprocessing.managers import SharedMemoryManager
-import os
-import struct
-import sys
 from typing import TYPE_CHECKING, TypeAlias
 
 logger = logging.getLogger(__name__)

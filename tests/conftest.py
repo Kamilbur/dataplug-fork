@@ -1,10 +1,12 @@
 import json
+import os
 import shutil
 import urllib.request
 from pathlib import Path
-import os
 
+import boto3
 import pytest
+from moto import mock_aws
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SRA_FIXTURES_DIR = FIXTURES_DIR / "fixtures"
@@ -17,8 +19,6 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 S3_BUCKET = os.getenv("S3_BUCKET", "test-sra")
 META_BUCKET = S3_BUCKET + ".meta"
 
-# Records per SHA-256 hash segment — must match the value used in prepare_tests.
-HASH_STEP = 1000
 
 _DOWNLOAD_CHUNK = 256 * 1024 * 1024  # 256 MB
 
@@ -57,10 +57,21 @@ def _download_sra_file(acc: str, url: str) -> None:
     SRA_FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     dest = SRA_FIXTURES_DIR / acc
     print(f"\nDownloading {acc} from {url} ...")
-    with urllib.request.urlopen(url) as resp:  # noqa: S310
-        with dest.open("wb") as f:
-            shutil.copyfileobj(resp, f, length=_DOWNLOAD_CHUNK)
+    with urllib.request.urlopen(url) as resp, dest.open("wb") as f:
+        shutil.copyfileobj(resp, f, length=_DOWNLOAD_CHUNK)
     print(f"Saved {acc} ({dest.stat().st_size // 1024 // 1024} MB)")
+
+
+@pytest.fixture
+def s3_uri(request):
+    """Upload local SRA fixture to mocked S3, yield S3 URI. request.param = accession."""
+    acc = request.param
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        for bucket in (S3_BUCKET, META_BUCKET):
+            s3.create_bucket(Bucket=bucket)
+        s3.upload_file(str(SRA_FIXTURES_DIR / acc), S3_BUCKET, acc)
+        yield f"s3://{S3_BUCKET}/{acc}"
 
 
 @pytest.fixture(scope="session", autouse=True)

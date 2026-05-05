@@ -1,147 +1,209 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from ctypes import (
-    c_uint64,
-    sizeof,
-)
-from dataclasses import dataclass, field
+import ctypes as C
 import io
 import logging
-import os
-from pathlib import Path
+import sysconfig
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
-from .internals._loader import get_table
-from .internals.download import download, download_range
-from .internals.experimental.cmaps import (
-    NcbiVdbSharedMemory,
-    get_ncbi_vdb_mapping,
-    pack_to,
-    save_mmaps,
-    save_preads,
-)
-from .internals.experimental.interval import Interval, merge_intervals, partition_dry
-from .internals.sra import SRAFile
-from .output import FastqLineQuadruple
+from .internals.download import download_range, stream_to_bytes
+from .internals.interval import Interval, merge_intervals, partition_dry
+
+if TYPE_CHECKING:
+    from dataplug.cloudobject import CloudObject
+
+    from .internals.sra import SRALines
 
 logger = logging.getLogger(__name__)
 
-PREAD_BUF_SIZE = 100 * sizeof(c_uint64)
-MMAP_BUF_SIZE = 100 * sizeof(c_uint64)
+_types_map = {1: C.c_uint8, 2: C.c_uint16, 4: C.c_uint32, 8: C.c_uint64}
+c_off_t = _types_map[sysconfig.get_config_var('SIZEOF_OFF_T')]
 
-libvdb_python_path = 'LIBVDB_PYTHON_DIR'
-libvdb_path = os.environ.get('NCBI_VDB_SO_PATH', '')
+MAX_RANGES = 1024
+_RangesArray = C.c_uint64 * (1 + MAX_RANGES * 3)
 
-if not libvdb_path:
-    logger.warning(
-        'For complete functionality of SRA backend provide path'
-        'to ncbi-vdb shared object in NCBI_VDB_SO_PATH environment variable.'
+_SYSCALLS = ["open", "close", "fstat", "read", "pread", "mmap", "munmap"]
+
+
+def _vdb():
+    from .internals.vdb import vdb
+    return vdb
+
+
+class FileInfo(C.Structure):
+    _fields_ = (
+        ('accession', C.c_char_p),
+        ('data', C.c_char_p),
+        ('size', C.c_size_t),
+        ('offset', c_off_t),
     )
 
 
-if TYPE_CHECKING:
+class ShimsMapping:
+    def __init__(self):
+        self._info = FileInfo.in_dll(_vdb()['shims'], 'info')
 
-    from dataplug.cloudobject import CloudObject
+    @property
+    def info(self):
+        return self._info
 
-    from .output import SRALines
-
-
-# For some reason, shared buffer does not work with default implementation,
-# so we create simplified one here
-@dataclass
-class QuadrupleCursor:
-    columns: dict
-
-    _column_names = (
-        "READ",
-        "(INSDC:quality:text:phred_33)QUALITY",
-        "NAME",
-        "READ_START",
-        "READ_LEN",
-    )
-
-    @classmethod
-    def from_filepath(cls, filepath):
-        table = get_table(filepath)
-
-        columns = table.CreateCursor().OpenColumns(list(cls._column_names))
-
-        return cls(columns)
-
-    def row(self, idx):
-        return [col.Read(idx) for col in self.columns.values()]
-
-    def __len__(self):
-        return self.columns[self._column_names[0]].row_range()[1]
+    @info.setter
+    def info(self, value):
+        dst = C.addressof(self._info)
+        src = C.addressof(value)
+        C.memmove(dst, src, C.sizeof(FileInfo))
+        self._keepalive = value
 
 
-def qc_range(cursor, start, stop, step):
-    for i in range(start + 1, stop + 1, step):
-        yield cursor.row(i)
+class EnabledMask:
+    def __init__(self):
+        self._vars = [C.c_int.in_dll(_vdb()['shims'], f'enable_{s}') for s in _SYSCALLS]
+
+    @contextmanager
+    def enabled_all(self):
+        saved = [v.value for v in self._vars]
+        for v in self._vars:
+            v.value = 1
+        try:
+            yield
+        finally:
+            for v, s in zip(self._vars, saved, strict=False):
+                v.value = s
+
+
+_shims_vars = None
+
+
+def _sv():
+    global _shims_vars
+    if _shims_vars is None:
+        lib = _vdb()['shims']
+        _shims_vars = {
+            'dp_mode':      C.c_int.in_dll(lib, 'dp_mode'),
+            'dp_sra_size':  C.c_size_t.in_dll(lib, 'dp_sra_size'),
+            'pread_ranges': _RangesArray.in_dll(lib, 'pread_ranges'),
+            'mmap_ranges':  _RangesArray.in_dll(lib, 'mmap_ranges'),
+        }
+    return _shims_vars
+
+
+def _read_ranges(arr, total_size):
+    count = arr[0]
+    if count == 0:
+        return []
+    result = []
+    for i in range(count):
+        pos = arr[2 * i + 1]
+        size = arr[2 * i + 2]
+        if pos + size + 4 < total_size:
+            size += 4
+        result.append((pos, pos + size))
+    arr[0] = 0
+    return result
+
+
+def _save_mmaps(mmaps, total_size):
+    mmaps.extend(_read_ranges(_sv()['mmap_ranges'], total_size))
+
+
+def _save_preads(preads, idx, total_size):
+    intervals = _read_ranges(_sv()['pread_ranges'], total_size)
+    if intervals:
+        preads[idx] = intervals
+
+
+def _fill_ranges_mode1(arr, entries):
+    arr[0] = len(entries)
+    for i, (buf_off, start, end) in enumerate(entries):
+        arr[3 * i + 1] = buf_off
+        arr[3 * i + 2] = start
+        arr[3 * i + 3] = end
 
 
 @contextmanager
 def temporary_sra(accession):
     with tempfile.TemporaryDirectory() as dpath:
         fpath = Path(dpath) / accession
-        with Path(fpath).open('w+', encoding='utf-8') as fp:
-            fp.write('s3re')
-            fp.flush()
-            yield str(fpath)
+        fpath.touch()
+        yield str(fpath)
 
 
 def accession(cloud_object: CloudObject) -> str:
     return cloud_object.path.key.split('/')[-1].split('.')[0]
 
 
-@dataclass
-class Mapping:
-    mmaps: list[Interval] = field(default_factory=list)
-    preads: dict[int, list[Interval]] = field(default_factory=dict)
+def _download_to_bytes(cloud_object: CloudObject) -> bytes:
+    resp = cloud_object.storage.get_object(
+        Bucket=cloud_object.path.bucket,
+        Key=cloud_object.path.key,
+    )
+    return stream_to_bytes(resp['Body'])
 
-    @classmethod
-    def from_cloud_object(cls, cloud_object: CloudObject) -> Mapping:
-        mmaps = cloud_object.get_attribute("mmaps")
-        preads = cloud_object.get_attribute("preads")
-        return cls(mmaps=mmaps, preads=preads)
 
-    def save(self, mmaps, preads, idx, total_size):
-        save_mmaps(mmaps, mmaps, total_size)
-        save_preads(preads, preads, idx, total_size)
+def _build_range_buffer(cloud_object, mmaps, preads):
+    chunks = []
+    buf_offset = 0
+    mmap_entries = []
+    pread_entries = []
+    mmaps = merge_intervals(mmaps) if mmaps else []
+    preads = merge_intervals(preads) if preads else []
+    for left, right in mmaps:
+        data = download_range(cloud_object, left, right - 1)
+        mmap_entries.append((buf_offset, left, right))
+        buf_offset += len(data)
+        chunks.append(data)
+    for left, right in preads:
+        data = download_range(cloud_object, left, right - 1)
+        pread_entries.append((buf_offset, left, right))
+        buf_offset += len(data)
+        chunks.append(data)
+    return b''.join(chunks), mmap_entries, pread_entries
 
 
 def preprocess_sra(cloud_object: CloudObject, step=250):
+    from .internals.sra import VColumns
+    from .internals.vdb_types import to_char_p
+
     logger.info('Preprocessing sra started')
 
-    ncbi_mapping = get_ncbi_vdb_mapping(libvdb_path)
-    ncbi_mapping.dp_sra_size = cloud_object.size
-    ncbi_mapping.dp_mode = 0
-
-    mapping = Mapping()
+    sv = _sv()
+    sv['dp_mode'].value = 0
+    sv['dp_sra_size'].value = cloud_object.size
+    sv['pread_ranges'][0] = 0
+    sv['mmap_ranges'][0] = 0
 
     acc = accession(cloud_object)
-    mmaps, preads = [], {}
-    with (NcbiVdbSharedMemory(ncbi_mapping.shm_buf, cloud_object.size) as nvsm,
-          NcbiVdbSharedMemory(ncbi_mapping.mmap_buf, MMAP_BUF_SIZE) as mmapsm,
-          NcbiVdbSharedMemory(ncbi_mapping.pread_buf, PREAD_BUF_SIZE) as prsm,
-                temporary_sra(acc) as fpath):
-        download(cloud_object, nvsm.buf)
-        qc = QuadrupleCursor.from_filepath(fpath)
-        total_lines = len(qc)
-        # mapping.save(mmaps, preads, -1, cloud_object.size)
-        save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
-        save_preads(preads, prsm.buf, -1, cloud_object.size)
-        for i, _ in enumerate(qc_range(qc, 0, total_lines, step=step)):
-            # mapping.save(mmaps, preads, i * step, cloud_object.size)
-            save_mmaps(mmaps, mmapsm.buf, cloud_object.size)
-            save_preads(preads, prsm.buf, i * step, cloud_object.size)
+    raw = _download_to_bytes(cloud_object)
 
-    # mmaps = merge_intervals(mmaps)
+    shims_mapping = ShimsMapping()
+    mask = EnabledMask()
+    mmaps, preads = [], {}
+
+    try:
+        with mask.enabled_all(), temporary_sra(acc) as fpath:
+            shims_mapping.info = FileInfo(
+                accession=to_char_p(acc),
+                data=to_char_p(raw),
+                size=len(raw),
+                offset=0,
+            )
+            with VColumns.from_filepath(fpath) as vcols:
+                total_lines = len(vcols)
+                _save_mmaps(mmaps, cloud_object.size)
+                _save_preads(preads, -1, cloud_object.size)
+                for i, row_idx in enumerate(range(1, total_lines + 1, step)):
+                    [col.read(row_idx) for col in vcols.columns]
+                    _save_mmaps(mmaps, cloud_object.size)
+                    _save_preads(preads, i * step, cloud_object.size)
+    finally:
+        sv['dp_mode'].value = 0
 
     return PreprocessingMetadata(
         metadata=io.BytesIO(b'nempty'),
@@ -159,36 +221,16 @@ class SRA:
     index_key: str
 
 
-def prefetch(mmaps, preads, cloud_object, nvsm, mmapsm, prsm):
-    nvms_buf_idx = 0
-    mmap_buf_idx = 0
-    dsize = sizeof(c_uint64)
-    pack_to(mmapsm.buf, 0, len(mmaps))
-    mmap_buf_idx += dsize
-    for left, right in mmaps:
-        length = right - left
-        nvsm.buf[nvms_buf_idx:nvms_buf_idx + length] = download_range(cloud_object, left, right - 1)
-        pack_to(mmapsm.buf, mmap_buf_idx, nvms_buf_idx)
-        mmap_buf_idx += dsize
-        pack_to(mmapsm.buf, mmap_buf_idx, left)
-        mmap_buf_idx += dsize
-        pack_to(mmapsm.buf, mmap_buf_idx, right)
-        mmap_buf_idx += dsize
-        nvms_buf_idx += length
+@dataclass
+class Mapping:
+    mmaps: list[Interval] = field(default_factory=list)
+    preads: dict[int, list[Interval]] = field(default_factory=dict)
 
-    pread_buf_idx = 0
-    pack_to(prsm.buf, 0, len(preads))
-    pread_buf_idx += dsize
-    for left, right in preads:
-        length = right - left
-        nvsm.buf[nvms_buf_idx:nvms_buf_idx + length] = download_range(cloud_object, left, right - 1)
-        pack_to(prsm.buf, pread_buf_idx, nvms_buf_idx)
-        pread_buf_idx += dsize
-        pack_to(prsm.buf, pread_buf_idx, left)
-        pread_buf_idx += dsize
-        pack_to(prsm.buf, pread_buf_idx, right)
-        pread_buf_idx += dsize
-        nvms_buf_idx += length
+    @classmethod
+    def from_cloud_object(cls, cloud_object: CloudObject) -> Mapping:
+        mmaps = cloud_object.get_attribute("mmaps")
+        preads = cloud_object.get_attribute("preads")
+        return cls(mmaps=mmaps, preads=preads)
 
 
 class SRASlice(CloudObjectSlice):
@@ -199,100 +241,75 @@ class SRASlice(CloudObjectSlice):
         self.preads = preads
         super().__init__(*args, **kwargs)
 
-    def partial_download(self):
-        yield from self.decompress(
-            dp_mode=1,
-            total_length=self.sum_lengths(self.mmaps) + self.sum_lengths(self.preads),
-            prefetch=prefetch
+    def partial_download(self, split=False) -> SRALines:
+        from .internals.sra import VColumns, _format_spot
+        from .internals.vdb_types import to_char_p
+
+        acc = accession(self.cloud_object)
+        raw, mmap_entries, pread_entries = _build_range_buffer(
+            self.cloud_object, self.mmaps, self.preads
         )
+        sv = _sv()
+        sv['dp_mode'].value = 1
+        sv['dp_sra_size'].value = self.cloud_object.size
+        _fill_ranges_mode1(sv['mmap_ranges'], mmap_entries)
+        _fill_ranges_mode1(sv['pread_ranges'], pread_entries)
 
-    def decompress(self, dp_mode, total_length, prefetch):
-        mapping = get_ncbi_vdb_mapping()
-        mapping.dp_sra_size = self.cloud_object.size
-        mapping.dp_mode = dp_mode
-        with (NcbiVdbSharedMemory(mapping.shm_buf, total_length) as nvsm,
-              NcbiVdbSharedMemory(mapping.mmap_buf, MMAP_BUF_SIZE) as mmapsm,
-              NcbiVdbSharedMemory(mapping.pread_buf, PREAD_BUF_SIZE) as prsm,
-                temporary_sra(accession(self.cloud_object)) as fpath):
-            prefetch(self.mmaps, self.preads, self.cloud_object, nvsm, mmapsm, prsm)
-            sra_file = SRAFile(fpath, paired=False)
-            for spot in sra_file.range(self.start, self.end):
-                reads_repr = tuple(str(FastqLineQuadruple(read)) for read in spot.reads())
-                write_unpaired = False
-                if not write_unpaired:
-                    yield reads_repr
-                else:
-                    yield reads_repr
+        shims_mapping = ShimsMapping()
+        mask = EnabledMask()
 
-    def get(self) -> SRALines:
-        return list(self.partial_download())
+        try:
+            with mask.enabled_all(), temporary_sra(acc) as fpath:
+                shims_mapping.info = FileInfo(
+                    accession=to_char_p(acc),
+                    data=to_char_p(raw),
+                    size=self.cloud_object.size,
+                    offset=0,
+                )
+                with VColumns.from_filepath(fpath) as vcols:
+                    for row_idx in range(self.start + 1, self.end + 1):
+                        row = [col.read(row_idx) for col in vcols.columns]
+                        yield _format_spot(acc, row_idx, *row, split=split)
+        finally:
+            sv['dp_mode'].value = 0
 
-    def lazy_get(self):
-        yield from self.partial_download()
+    def get(self, split=False) -> SRALines:
+        return list(self.partial_download(split=split))
+
+    def lazy_get(self, split=False):
+        yield from self.partial_download(split=split)
 
     @staticmethod
     def sum_lengths(iterable):
-        length = 0
-        for left, right in iterable:
-            length += right - left
-
-        return length
-
-
-# def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[SRASlice]:
-#     preads, mmaps = mapping.preads, mapping.mmaps
-#     global_preads = preads[-1] + preads[0]
-#     del preads[-1]
-#     idx = 0
-#     slices = []
-#     local_preads = global_preads.copy()
-#     prev = -1
-
-#     for line in sorted(preads.keys()):
-#         if line >= ranges[idx][1]:
-#             local_preads += preads[line]
-#             while line >= ranges[idx][1]:
-#                 slices.append(SRASlice(*ranges[idx], mmaps, merge_intervals(local_preads)))
-#                 idx += 1
-#             local_preads = global_preads.copy() + preads[prev]
-
-#         local_preads += preads[line]
-#         prev = line
-
-#     while len(slices) < len(ranges):
-#         slices.append(SRASlice(*ranges[idx], mmaps, merge_intervals(local_preads)))
-#         idx += 1
-
-#     assert len(slices) == len(ranges)
-#     return slices
+        return sum(right - left for left, right in iterable)
 
 
 def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[SRASlice]:
-    preads, mmaps = mapping.preads, mapping.mmaps
-    global_preads = preads[-1]# + preads[0]
-    del preads[-1]
-    i = 0
-    j = 0
+    mmaps = mapping.mmaps
+    preads = {int(key): list(value) for key, value in mapping.preads.items()}
+    global_preads = preads.pop(-1, [])
     slices = []
     accumulator = global_preads.copy()
 
-    group_ends = sorted(preads.keys())
-    while i < len(group_ends) and j < len(ranges):
-        g = group_ends[i]
-        p = ranges[j][1]
-        accumulator += preads[g]
+    group_ends = iter(sorted(preads.keys()))
+    group_end = next(group_ends, None)
 
-        if g < p:
-            i += 1
-        else:
-            slices.append(SRASlice(*ranges[j], mmaps, merge_intervals(accumulator)))
-            j += 1
-            if j < len(ranges):
-                accumulator = global_preads.copy() #+ preads[G[i - 1]]
+    for range_start, range_end in ranges:
+        while group_end is not None and group_end < range_end:
+            accumulator.extend(preads[group_end])
+            group_end = next(group_ends, None)
 
-    while j < len(ranges):
-        slices.append(SRASlice(*ranges[j], mmaps, merge_intervals(accumulator)))
-        j += 1
+        if group_end is not None:
+            accumulator.extend(preads[group_end])
+            group_end = next(group_ends, None)
+
+        slices.append(SRASlice(
+            range_start,
+            range_end,
+            mmaps,
+            merge_intervals(accumulator) if accumulator else [],
+        ))
+
     assert len(slices) == len(ranges)
     return slices
 
@@ -300,12 +317,10 @@ def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[SRASlice]:
 @PartitioningStrategy(dataformat=SRA)
 def partition_chunks_strategy(
     cloud_object: CloudObject,
-    num_chunks: int
+    num_chunks: int,
 ) -> list[SRASlice]:
     logger.info('SRA partitioning started')
-
     total_lines = int(cloud_object.get_attribute("total_lines"))
     mapping = Mapping.from_cloud_object(cloud_object)
-
     ranges = partition_dry(total_lines, num_chunks)
     return generate_slices(mapping, ranges)

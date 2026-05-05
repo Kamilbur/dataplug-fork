@@ -1,215 +1,105 @@
-from __future__ import annotations
+import contextlib
+import ctypes as C
 
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from pathlib import Path
-import sys
-from typing import Any, Protocol, TypeGuard, TypeVar, override
+from .vdb import vdb
+from .vdb_types import to_char_p
 
-from ._loader import get_table
-
-VColumnRead = Callable[[int], Any]
-T = TypeVar("T")
+SRALines = list[tuple[str, ...]]
 
 
-def no_nones(items: Iterable[T | None]) -> TypeGuard[Iterable[T]]:
-    return all(item is not None for item in items)
+_COLUMN_NAMES = (
+    "READ",
+    "(INSDC:quality:text:phred_33)QUALITY",
+    "NAME",
+    "READ_START",
+    "READ_LEN",
+)
 
 
-@dataclass(slots=True)
-class SequenceRead:
-    _spot: Spot
-    start: int
-    length: int
-    split_num: int
-
-    @property
-    def read(self) -> str:
-        return self._spot.read[self.start:self.start + self.length]
-
-    @property
-    def qual(self) -> str:
-        return self._spot.qual[self.start:self.start + self.length]
-
-    @property
-    def name(self) -> str:
-        return self._spot.name
-
-    @property
-    def accession(self) -> str:
-        return self._spot.accession
-
-    @property
-    def idx(self) -> int:
-        return self._spot.idx
+def _release(name, handle):
+    if handle is not None and handle.value:
+        with contextlib.suppress(Exception):
+            getattr(vdb, name)(handle)
 
 
-class VColumn(Protocol):
-    def Read(self, idx: int) -> Any:  # noqa: N802
-        ...
-
-    def row_range(self) -> tuple[int, int]:
-        ...
-
-
-class FakeVColumn(VColumn):
-    def __init__(self, read_func: VColumnRead):
-        self._read_func = read_func
-
-    def Read(self, idx: int) -> Any:  # noqa: N802
-        return self._read_func(idx)
-
-    @override
-    def row_range(self) -> tuple[int, int]:
-        return (1, sys.maxsize)
+def _open_table(mgr, path):
+    tab = C.c_void_p()
+    if vdb.VDBManagerOpenTableRead(mgr, C.byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
+        return tab, None
+    db = C.c_void_p()
+    if vdb.VDBManagerOpenDBRead(mgr, C.byref(db), C.c_void_p(0), to_char_p(path)) != 0:
+        raise ValueError("Not an SRA-object: " + path)
+    if vdb.VDatabaseOpenTableRead(db, C.byref(tab), to_char_p("SEQUENCE")) == 0:
+        return tab, db
+    _release("VDatabaseRelease", db)
+    raise ValueError("Not an SRA-object: " + path)
 
 
-@dataclass(slots=True)
-class Spot:
-    accession: str
-    idx: int
-    read: str
-    qual: str
-    name: str
-    starts: list[int]
-    lengths: list[int]
-
-    def reads(self) -> list[SequenceRead]:
-        reads = []
-        for i, (start, length) in enumerate(zip(self.starts, self.lengths, strict=False)):
-            if length > 0:
-                reads.append(SequenceRead(
-                    _spot=self,
-                    start=start,
-                    length=length,
-                    split_num=i + 1
-                ))
-
-        return reads
+def _open_cursor(path):
+    nat_dir = C.c_void_p()
+    mgr = C.c_void_p()
+    cur = C.c_void_p()
+    vdb.KDirectoryNativeDir_v1(C.byref(nat_dir))
+    vdb.VDBManagerMakeRead(C.byref(mgr), nat_dir)
+    tab, db = _open_table(mgr, path)
+    vdb.VTableCreateCursorRead(tab, C.byref(cur))
+    return cur, tab, db, mgr, nat_dir
 
 
-class SequenceTableVCursor:
-    column_names = (
-        "READ",
-        "(INSDC:quality:text:phred_33)QUALITY",
-        "NAME",
-        "READ_START",
-        "READ_LEN"
-        )
-
-    def __init__(self, accession: str, split: bool = True):
-        self.accession = accession
-        self.split = split
-        self.columns = self._unpack_columns()
-
-    def _columns(self) -> dict[str, VColumn]:
-        table = get_table(self.accession)
-        cursor = table.CreateCursor()
-        return cursor.OpenColumns(list(self.column_names))
-
-    def _unpack_columns(self) -> tuple[VColumn, ...]:
-        columns_dict = self._columns()
-        columns = [columns_dict.get(name) for name in self.column_names]
-
-        if not self.split or columns[-1] is None or columns[-2] is None:
-            columns[-2] = FakeVColumn(self._default_read_starts)
-            columns[-1] = FakeVColumn(self._default_read_lengths)
-
-        if not no_nones(columns):
-            msg = (
-                "Could not open sequence table. "
-                f"{self.accession} is not an SRA-object"
-            )
-            raise ValueError(msg)
-
-        return tuple(columns)
-
-    def spot(self, idx: int) -> Spot:
-        data = [col.Read(idx) for col in self.columns]
-        return Spot(self.accession, idx, *data)
-
-    @staticmethod
-    def _default_read_starts(_: int) -> list[int]:
-        return [0]
-
-    def _default_read_lengths(self, idx: int) -> list[int]:
-        return [len(self.read_column.Read(idx))]
-
-    @property
-    def read_column(self) -> VColumn:
-        return self.columns[0]
+class VColumns:
+    def __init__(self, handles):
+        from .vdb_types import VColumn
+        cur, tab, db, mgr, nat_dir = handles
+        self.cur = cur
+        self._tab = tab
+        self._db = db
+        self._mgr = mgr
+        self._nat_dir = nat_dir
+        self._closed = False
+        self.columns = []
+        for name in _COLUMN_NAMES:
+            idx = C.c_int()
+            vdb.VCursorAddColumn(cur, C.byref(idx), to_char_p(name))
+            self.columns.append(VColumn(idx.value, cur))
+        vdb.VCursorOpen(cur)
+        for col in self.columns:
+            col.update()
 
     def __len__(self):
-        return self.read_column.row_range()[1]
+        return self.columns[0].row_range()[1]
+
+    @classmethod
+    def from_filepath(cls, path):
+        return cls(_open_cursor(path))
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        _release("VCursorRelease", self.cur)
+        _release("VTableRelease", self._tab)
+        _release("VDatabaseRelease", self._db)
+        _release("VDBManagerRelease", self._mgr)
+        _release("KDirectoryRelease_v1", self._nat_dir)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        self.close()
 
 
-def _init_read_range(*args: int) -> range:
-    """ Initialize a range for read indices based on arguments.
-        Mimics Python's built-in range.
-    """
-    argc = len(args)
-
-    if argc == 0:
-        msg = 'QuadrupleRange expected at least 1 argument, got 0'
-        raise TypeError(msg)
-    if argc > 3:  # noqa: PLR2004
-        msg = f'QuadrupleRange expected at most 3 arguments, got {len(args)}'
-        raise TypeError(msg)
-
-    for i, arg in enumerate(args):
-        if not isinstance(arg, int):
-            msg = f'QuadrupleRange argument {i} must be an integer'
-            raise TypeError(msg)
-
-    match argc:
-        case 1:
-            start = 1
-            stop = args[0] + 1
-            step = 1
-        case 2:
-            start = args[0] + 1
-            stop = args[1] + 1
-            step = 1
-        case 3:
-            start = args[0] + 1
-            stop = args[1] + 1
-            step = args[2]
-        case _:
-            msg = "Unreachable code"
-            raise RuntimeError(msg)
-
-    if step == 0:
-        msg = "QuadrupleRange argument 3 must not be zero"
-        raise ValueError()
-    return range(start, stop, step)
-
-
-class SequenceTableVRange:
-    def __init__(self, cursor: SequenceTableVCursor, *args: int):
-        self.cursor = cursor
-        self.range = _init_read_range(*args)
-
-    def __len__(self):
-        return len(self.range)
-
-    def __iter__(self):
-        for idx in self.range:
-            yield self.cursor.spot(idx)
-
-
-class SRAFile:
-    def __init__(self, filepath: str | Path, paired: bool = True):
-        accession = Path(filepath).name
-        self.accession = accession
-        self.paired = paired
-        self._cursor: SequenceTableVCursor | None = None
-
-    def range(self, *args: int) -> SequenceTableVRange:
-        if self._cursor is None:
-            self._cursor = SequenceTableVCursor(self.accession, split=self.paired)
-        return SequenceTableVRange(self._cursor, *args)
-
-    def __len__(self):
-        if self._cursor is None:
-            self._cursor = SequenceTableVCursor(self.accession, split=self.paired)
-        return len(self._cursor)
+def _format_spot(acc, idx, read_str, qual_str, name, starts, lengths, split=True):
+    header = f'{acc}.{idx} {name} length={len(read_str)}'
+    if not split:
+        return (f'@{header}\n{read_str}\n+{header}\n{qual_str}\n',)
+    result = []
+    for start, length in zip(starts, lengths, strict=True):
+        if length > 0:
+            r = read_str[start:start + length]
+            q = qual_str[start:start + length]
+            result.append(f'@{header}\n{r}\n+{header}\n{q}\n')
+    return tuple(result)

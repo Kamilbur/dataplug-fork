@@ -47,7 +47,7 @@ include-package-data = false
 include = ["dataplug*"]
 
 [tool.setuptools.package-data]
-"dataplug.formats.genomics.sra" = ["libncbi-vdb.so"]
+"dataplug.formats.genomics.sra.internals" = ["libncbi-vdb.so", "libshims.so"]
 
 [tool.black]
 line-length = 119

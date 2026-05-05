@@ -66,7 +66,7 @@ def download(cloud_object: CloudObject, destination: memoryview[int]) -> None:
     storage = cloud_object.storage
     resp = storage.get_object(Bucket=bucket, Key=key)
     if not status_ok(resp):
-        raise DownloadError()
+        raise DownloadError
     data_stream = resp["Body"]
 
     stream_to_memoryview(data_stream, destination)

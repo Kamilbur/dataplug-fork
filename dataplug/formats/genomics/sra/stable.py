@@ -2,29 +2,32 @@ from __future__ import annotations
 
 import io
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
-from .output import FastqLineQuadruple
-from .internals.sra import SRAFile
-
 if TYPE_CHECKING:
     from dataplug.cloudobject import CloudObject
-    from .output import SRALines
+
+    from .internals.sra import SRALines
 
 logger = logging.getLogger(__name__)
 
 
 def preprocess_sra(cloud_object: CloudObject):
+    from .internals.sra import VColumns
+
     logger.info('Preprocessing sra started')
 
-    sra_file = SRAFile(cloud_object.path.as_uri())
+    acc = Path(cloud_object.path.as_uri()).name.split('.')[0]
+    with VColumns.from_filepath(acc) as vcols:
+        num_lines = len(vcols)
     return PreprocessingMetadata(
         metadata=io.BytesIO(b'nempty'),
         attributes={
-            'total_lines': len(sra_file),
+            'total_lines': num_lines,
         }
     )
 
@@ -45,16 +48,16 @@ class SRASlice(CloudObjectSlice):
         return list(self.lazy_get(split=split))
 
     def lazy_get(self, split: bool = True, write_unpaired: bool = False):
+        from .internals.sra import VColumns, _format_spot
+
         if not self.cloud_object:
             msg = "Cloud object is not set for this slice."
             raise ValueError(msg)
-        sra_file = SRAFile(self.cloud_object.path.as_uri(), paired=split)
-        for spot in sra_file.range(len(sra_file)):
-            reads_repr = tuple(str(FastqLineQuadruple(read)) for read in spot.reads())
-            if not write_unpaired:
-                yield reads_repr[:2]
-            else:
-                yield reads_repr
+        acc = self.cloud_object.path.as_uri()
+        with VColumns.from_filepath(acc) as vcols:
+            for row_idx in range(self.start + 1, self.end + 1):
+                row = [col.read(row_idx) for col in vcols.columns]
+                yield _format_spot(acc, row_idx, *row, split=split)
 
 
 def partition_into_ranges(
