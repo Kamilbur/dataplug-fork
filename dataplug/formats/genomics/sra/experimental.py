@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from cdlml import get_var
+
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
@@ -48,7 +50,7 @@ class FileInfo(C.Structure):
 
 class ShimsMapping:
     def __init__(self):
-        self._info = FileInfo.in_dll(_vdb()['shims'], 'info')
+        self._info = get_var(_vdb()['shims'], FileInfo, 'info')
 
     @property
     def info(self):
@@ -64,7 +66,7 @@ class ShimsMapping:
 
 class EnabledMask:
     def __init__(self):
-        self._vars = [C.c_int.in_dll(_vdb()['shims'], f'enable_{s}') for s in _SYSCALLS]
+        self._vars = [get_var(_vdb()['shims'], C.c_int, f'enable_{s}') for s in _SYSCALLS]
 
     @contextmanager
     def enabled_all(self):
@@ -86,10 +88,10 @@ def _sv():
     if _shims_vars is None:
         lib = _vdb()['shims']
         _shims_vars = {
-            'dp_mode':      C.c_int.in_dll(lib, 'dp_mode'),
-            'dp_sra_size':  C.c_size_t.in_dll(lib, 'dp_sra_size'),
-            'pread_ranges': _RangesArray.in_dll(lib, 'pread_ranges'),
-            'mmap_ranges':  _RangesArray.in_dll(lib, 'mmap_ranges'),
+            'dp_mode':      get_var(lib, C.c_int, 'dp_mode'),
+            'dp_sra_size':  get_var(lib, C.c_size_t, 'dp_sra_size'),
+            'pread_ranges': get_var(lib, _RangesArray, 'pread_ranges'),
+            'mmap_ranges':  get_var(lib, _RangesArray, 'mmap_ranges'),
         }
     return _shims_vars
 

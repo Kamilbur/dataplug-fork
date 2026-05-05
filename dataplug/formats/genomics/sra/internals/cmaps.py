@@ -19,6 +19,8 @@ from ctypes import (
 from multiprocessing.managers import SharedMemoryManager
 from typing import TYPE_CHECKING, TypeAlias
 
+from cdlml import get_var
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,12 +65,12 @@ class NcbiVdbMapping:
             self._lib.close_shmem.restype = None
             self._lib.close_shmem.argtypes = [ShmInfo_p]
 
-            self._dp_sra_size = c_size_t.in_dll(self._lib, "dp_sra_size")
-            self._dp_mode = c_int.in_dll(self._lib, "dp_mode")
+            self._dp_sra_size = get_var(self._lib, c_size_t, "dp_sra_size")
+            self._dp_mode = get_var(self._lib, c_int, "dp_mode")
 
-            self.shm_buf = ShmInfo.in_dll(self._lib, "shm_buf")
-            self.mmap_buf = ShmInfo.in_dll(self._lib, "mmap_buf")
-            self.pread_buf = ShmInfo.in_dll(self._lib, "pread_buf")
+            self.shm_buf = get_var(self._lib, ShmInfo, "shm_buf")
+            self.mmap_buf = get_var(self._lib, ShmInfo, "mmap_buf")
+            self.pread_buf = get_var(self._lib, ShmInfo, "pread_buf")
         except AttributeError as e:
             msg = (
                 f'Probably NCBI_VDB_SO_PATH environment variable is not set.\n'
