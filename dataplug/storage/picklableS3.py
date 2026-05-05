@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from contextlib import suppress
-from pathlib import posixpath, PurePath
+from pathlib import posixpath, Path
 from typing import TYPE_CHECKING
 
 import boto3
@@ -292,7 +292,7 @@ class _S3Flavour(_PosixFlavour):
         return uri.replace("file:///", "s3://")
 
 
-class S3Path(PurePath):
+class S3Path(Path):
     """
     PurePath subclass for AWS S3 service.
     Source: https://github.com/liormizr/s3path
