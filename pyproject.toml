@@ -36,6 +36,8 @@ geospatial = [
     "laspy",
     "PDAL"
 ]
+sra = ["dataplug-sra-native @ file:./sra_native"]
+dev = ["pytest", "moto[s3]"]
 
 
 [tool.setuptools]
@@ -43,6 +45,9 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["dataplug*"]
+
+[tool.setuptools.package-data]
+"dataplug.formats.genomics.sra" = ["libncbi-vdb.so"]
 
 [tool.black]
 line-length = 119
