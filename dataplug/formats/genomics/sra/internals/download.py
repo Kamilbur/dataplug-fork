@@ -37,7 +37,7 @@ def stream_to_callback(stream, append: Callable[[bytes, int], None]) -> None:
         append(chunk, idx)
         idx += len(chunk)
         chunk = stream.read(CHUNK_SIZE)
-        logger.info('Next bytes %s', len(chunk))
+        logger.info("Next bytes %s", len(chunk))
     if hasattr(stream, "close"):
         stream.close()
 
@@ -45,7 +45,7 @@ def stream_to_callback(stream, append: Callable[[bytes, int], None]) -> None:
 def stream_to_memoryview(stream, destination: memoryview[int]) -> None:
 
     def memoryview_append(chunk: bytes, idx: int) -> None:
-        destination[idx:idx + len(chunk)] = chunk
+        destination[idx : idx + len(chunk)] = chunk
 
     stream_to_callback(stream, memoryview_append)
 
@@ -57,7 +57,7 @@ def stream_to_bytes(stream) -> bytes:
         chunks.append(chunk)
 
     stream_to_callback(stream, bytes_append)
-    return b''.join(chunks)
+    return b"".join(chunks)
 
 
 def download(cloud_object: CloudObject, destination: memoryview[int]) -> None:
@@ -80,4 +80,4 @@ def download_range(cloud_object, left, right):
         Key=key,
         Range=f"bytes={left}-{right}",
     )
-    return stream_to_bytes(res['Body'])
+    return stream_to_bytes(res["Body"])

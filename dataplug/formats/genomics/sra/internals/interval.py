@@ -8,8 +8,8 @@ def ith_part(i: int, size: int, at: int = 0) -> Interval:
 
 
 def partition_dry(total: int, num_chunks: int) -> list[Interval]:
-    """ Divide range [0, total) into chunks of approximately equal size represented as
-        tuples of [start, end).
+    """Divide range [0, total) into chunks of approximately equal size represented as
+    tuples of [start, end).
     """
     if total == 0:
         return []
@@ -27,7 +27,7 @@ def partition_dry(total: int, num_chunks: int) -> list[Interval]:
 
 
 def merge_intervals(intervals) -> list[Interval]:
-    """ Given a list of intervals, merge overlapping intervals and return the merged list. """
+    """Given a list of intervals, merge overlapping intervals and return the merged list."""
     heights = defaultdict(lambda: 0)
     for tup in intervals:
         heights[tup[0]] += 1

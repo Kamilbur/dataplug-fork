@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cdlml import get_var
+from cdlml import get_var, memmove, addressof
 
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _types_map = {1: C.c_uint8, 2: C.c_uint16, 4: C.c_uint32, 8: C.c_uint64}
-c_off_t = _types_map[sysconfig.get_config_var('SIZEOF_OFF_T')]
+c_off_t = _types_map[sysconfig.get_config_var("SIZEOF_OFF_T")]
 
 MAX_RANGES = 1024
 _RangesArray = C.c_uint64 * (1 + MAX_RANGES * 3)
@@ -36,21 +36,22 @@ _SYSCALLS = ["open", "close", "fstat", "read", "pread", "mmap", "munmap"]
 
 def _vdb():
     from .internals.vdb import vdb
+
     return vdb
 
 
 class FileInfo(C.Structure):
     _fields_ = (
-        ('accession', C.c_char_p),
-        ('data', C.c_char_p),
-        ('size', C.c_size_t),
-        ('offset', c_off_t),
+        ("accession", C.c_char_p),
+        ("data", C.c_char_p),
+        ("size", C.c_size_t),
+        ("offset", c_off_t),
     )
 
 
 class ShimsMapping:
     def __init__(self):
-        self._info = get_var(_vdb()['shims'], FileInfo, 'info')
+        self._info = get_var(_vdb()["shims"], FileInfo, "info")
 
     @property
     def info(self):
@@ -58,15 +59,15 @@ class ShimsMapping:
 
     @info.setter
     def info(self, value):
-        dst = C.addressof(self._info)
-        src = C.addressof(value)
-        C.memmove(dst, src, C.sizeof(FileInfo))
+#        dst = addressof(self._info)
+#        src = addressof(value)
+        memmove(self._info, value, C.sizeof(FileInfo))
         self._keepalive = value
 
 
 class EnabledMask:
     def __init__(self):
-        self._vars = [get_var(_vdb()['shims'], C.c_int, f'enable_{s}') for s in _SYSCALLS]
+        self._vars = [get_var(_vdb()["shims"], C.c_int, f"enable_{s}") for s in _SYSCALLS]
 
     @contextmanager
     def enabled_all(self):
@@ -86,12 +87,12 @@ _shims_vars = None
 def _sv():
     global _shims_vars
     if _shims_vars is None:
-        lib = _vdb()['shims']
+        lib = _vdb()["shims"]
         _shims_vars = {
-            'dp_mode':      get_var(lib, C.c_int, 'dp_mode'),
-            'dp_sra_size':  get_var(lib, C.c_size_t, 'dp_sra_size'),
-            'pread_ranges': get_var(lib, _RangesArray, 'pread_ranges'),
-            'mmap_ranges':  get_var(lib, _RangesArray, 'mmap_ranges'),
+            "dp_mode": get_var(lib, C.c_int, "dp_mode"),
+            "dp_sra_size": get_var(lib, C.c_size_t, "dp_sra_size"),
+            "pread_ranges": get_var(lib, _RangesArray, "pread_ranges"),
+            "mmap_ranges": get_var(lib, _RangesArray, "mmap_ranges"),
         }
     return _shims_vars
 
@@ -112,11 +113,11 @@ def _read_ranges(arr, total_size):
 
 
 def _save_mmaps(mmaps, total_size):
-    mmaps.extend(_read_ranges(_sv()['mmap_ranges'], total_size))
+    mmaps.extend(_read_ranges(_sv()["mmap_ranges"], total_size))
 
 
 def _save_preads(preads, idx, total_size):
-    intervals = _read_ranges(_sv()['pread_ranges'], total_size)
+    intervals = _read_ranges(_sv()["pread_ranges"], total_size)
     if intervals:
         preads[idx] = intervals
 
@@ -138,7 +139,7 @@ def temporary_sra(accession):
 
 
 def accession(cloud_object: CloudObject) -> str:
-    return cloud_object.path.key.split('/')[-1].split('.')[0]
+    return cloud_object.path.key.split("/")[-1].split(".")[0]
 
 
 def _download_to_bytes(cloud_object: CloudObject) -> bytes:
@@ -146,7 +147,7 @@ def _download_to_bytes(cloud_object: CloudObject) -> bytes:
         Bucket=cloud_object.path.bucket,
         Key=cloud_object.path.key,
     )
-    return stream_to_bytes(resp['Body'])
+    return stream_to_bytes(resp["Body"])
 
 
 def _build_range_buffer(cloud_object, mmaps, preads):
@@ -166,20 +167,20 @@ def _build_range_buffer(cloud_object, mmaps, preads):
         pread_entries.append((buf_offset, left, right))
         buf_offset += len(data)
         chunks.append(data)
-    return b''.join(chunks), mmap_entries, pread_entries
+    return b"".join(chunks), mmap_entries, pread_entries
 
 
 def preprocess_sra(cloud_object: CloudObject, step=250):
     from .internals.sra import VColumns
     from .internals.vdb_types import to_char_p
 
-    logger.info('Preprocessing sra started')
+    logger.info("Preprocessing sra started")
 
     sv = _sv()
-    sv['dp_mode'].value = 0
-    sv['dp_sra_size'].value = cloud_object.size
-    sv['pread_ranges'][0] = 0
-    sv['mmap_ranges'][0] = 0
+    sv["dp_mode"].value = 0
+    sv["dp_sra_size"].value = cloud_object.size
+    sv["pread_ranges"][0] = 0
+    sv["mmap_ranges"][0] = 0
 
     acc = accession(cloud_object)
     raw = _download_to_bytes(cloud_object)
@@ -205,15 +206,15 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
                     _save_mmaps(mmaps, cloud_object.size)
                     _save_preads(preads, i * step, cloud_object.size)
     finally:
-        sv['dp_mode'].value = 0
+        sv["dp_mode"].value = 0
 
     return PreprocessingMetadata(
-        metadata=io.BytesIO(b'nempty'),
+        metadata=io.BytesIO(b"nempty"),
         attributes={
-            'total_lines': total_lines,
-            'mmaps': mmaps,
-            'preads': preads,
-        }
+            "total_lines": total_lines,
+            "mmaps": mmaps,
+            "preads": preads,
+        },
     )
 
 
@@ -252,10 +253,10 @@ class SRASlice(CloudObjectSlice):
             self.cloud_object, self.mmaps, self.preads
         )
         sv = _sv()
-        sv['dp_mode'].value = 1
-        sv['dp_sra_size'].value = self.cloud_object.size
-        _fill_ranges_mode1(sv['mmap_ranges'], mmap_entries)
-        _fill_ranges_mode1(sv['pread_ranges'], pread_entries)
+        sv["dp_mode"].value = 1
+        sv["dp_sra_size"].value = self.cloud_object.size
+        _fill_ranges_mode1(sv["mmap_ranges"], mmap_entries)
+        _fill_ranges_mode1(sv["pread_ranges"], pread_entries)
 
         shims_mapping = ShimsMapping()
         mask = EnabledMask()
@@ -273,7 +274,7 @@ class SRASlice(CloudObjectSlice):
                         row = [col.read(row_idx) for col in vcols.columns]
                         yield _format_spot(acc, row_idx, *row, split=split)
         finally:
-            sv['dp_mode'].value = 0
+            sv["dp_mode"].value = 0
 
     def get(self, split=False) -> SRALines:
         return list(self.partial_download(split=split))
@@ -305,12 +306,14 @@ def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[SRASlice]:
             accumulator.extend(preads[group_end])
             group_end = next(group_ends, None)
 
-        slices.append(SRASlice(
-            range_start,
-            range_end,
-            mmaps,
-            merge_intervals(accumulator) if accumulator else [],
-        ))
+        slices.append(
+            SRASlice(
+                range_start,
+                range_end,
+                mmaps,
+                merge_intervals(accumulator) if accumulator else [],
+            )
+        )
 
     assert len(slices) == len(ranges)
     return slices
@@ -321,7 +324,7 @@ def partition_chunks_strategy(
     cloud_object: CloudObject,
     num_chunks: int,
 ) -> list[SRASlice]:
-    logger.info('SRA partitioning started')
+    logger.info("SRA partitioning started")
     total_lines = int(cloud_object.get_attribute("total_lines"))
     mapping = Mapping.from_cloud_object(cloud_object)
     ranges = partition_dry(total_lines, num_chunks)

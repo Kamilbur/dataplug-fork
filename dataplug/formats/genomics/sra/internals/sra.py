@@ -3,6 +3,7 @@ import ctypes as C
 
 from .vdb import vdb
 from .vdb_types import to_char_p
+import cdlml
 
 SRALines = list[tuple[str, ...]]
 
@@ -24,12 +25,12 @@ def _release(name, handle):
 
 def _open_table(mgr, path):
     tab = C.c_void_p()
-    if vdb.VDBManagerOpenTableRead(mgr, C.byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
+    if vdb.VDBManagerOpenTableRead(mgr, cdlml.byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
         return tab, None
     db = C.c_void_p()
-    if vdb.VDBManagerOpenDBRead(mgr, C.byref(db), C.c_void_p(0), to_char_p(path)) != 0:
+    if vdb.VDBManagerOpenDBRead(mgr, cdlml.byref(db), C.c_void_p(0), to_char_p(path)) != 0:
         raise ValueError("Not an SRA-object: " + path)
-    if vdb.VDatabaseOpenTableRead(db, C.byref(tab), to_char_p("SEQUENCE")) == 0:
+    if vdb.VDatabaseOpenTableRead(db, cdlml.byref(tab), to_char_p("SEQUENCE")) == 0:
         return tab, db
     _release("VDatabaseRelease", db)
     raise ValueError("Not an SRA-object: " + path)
@@ -39,16 +40,17 @@ def _open_cursor(path):
     nat_dir = C.c_void_p()
     mgr = C.c_void_p()
     cur = C.c_void_p()
-    vdb.KDirectoryNativeDir_v1(C.byref(nat_dir))
-    vdb.VDBManagerMakeRead(C.byref(mgr), nat_dir)
+    vdb.KDirectoryNativeDir_v1(cdlml.byref(nat_dir))
+    vdb.VDBManagerMakeRead(cdlml.byref(mgr), nat_dir)
     tab, db = _open_table(mgr, path)
-    vdb.VTableCreateCursorRead(tab, C.byref(cur))
+    vdb.VTableCreateCursorRead(tab, cdlml.byref(cur))
     return cur, tab, db, mgr, nat_dir
 
 
 class VColumns:
     def __init__(self, handles):
         from .vdb_types import VColumn
+
         cur, tab, db, mgr, nat_dir = handles
         self.cur = cur
         self._tab = tab
@@ -59,7 +61,7 @@ class VColumns:
         self.columns = []
         for name in _COLUMN_NAMES:
             idx = C.c_int()
-            vdb.VCursorAddColumn(cur, C.byref(idx), to_char_p(name))
+            vdb.VCursorAddColumn(cur, cdlml.byref(idx), to_char_p(name))
             self.columns.append(VColumn(idx.value, cur))
         vdb.VCursorOpen(cur)
         for col in self.columns:
@@ -93,13 +95,13 @@ class VColumns:
 
 
 def _format_spot(acc, idx, read_str, qual_str, name, starts, lengths, split=True):
-    header = f'{acc}.{idx} {name} length={len(read_str)}'
+    header = f"{acc}.{idx} {name} length={len(read_str)}"
     if not split:
-        return (f'@{header}\n{read_str}\n+{header}\n{qual_str}\n',)
+        return (f"@{header}\n{read_str}\n+{header}\n{qual_str}\n",)
     result = []
     for start, length in zip(starts, lengths, strict=True):
         if length > 0:
-            r = read_str[start:start + length]
-            q = qual_str[start:start + length]
-            result.append(f'@{header}\n{r}\n+{header}\n{q}\n')
+            r = read_str[start : start + length]
+            q = qual_str[start : start + length]
+            result.append(f"@{header}\n{r}\n+{header}\n{q}\n")
     return tuple(result)

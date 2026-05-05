@@ -19,16 +19,16 @@ logger = logging.getLogger(__name__)
 def preprocess_sra(cloud_object: CloudObject):
     from .internals.sra import VColumns
 
-    logger.info('Preprocessing sra started')
+    logger.info("Preprocessing sra started")
 
-    acc = Path(cloud_object.path.as_uri()).name.split('.')[0]
+    acc = Path(cloud_object.path.as_uri()).name.split(".")[0]
     with VColumns.from_filepath(acc) as vcols:
         num_lines = len(vcols)
     return PreprocessingMetadata(
-        metadata=io.BytesIO(b'nempty'),
+        metadata=io.BytesIO(b"nempty"),
         attributes={
-            'total_lines': num_lines,
-        }
+            "total_lines": num_lines,
+        },
     )
 
 
@@ -60,43 +60,31 @@ class SRASlice(CloudObjectSlice):
                 yield _format_spot(acc, row_idx, *row, split=split)
 
 
-def partition_into_ranges(
-    total_lines: int,
-    num_chunks: int
-) -> list[tuple[int, int]]:
+def partition_into_ranges(total_lines: int, num_chunks: int) -> list[tuple[int, int]]:
     n, r = divmod(total_lines, num_chunks)
 
     if total_lines == 0:
         return []
     if total_lines < num_chunks:
         logger.warning(
-            'Number of chunks given is greater '
-            'than total number of lines in file. '
-            'Dividing files into single-line chunks... '
-            'For performance gains, consider reducing '
-            'number of chunks.'
+            "Number of chunks given is greater "
+            "than total number of lines in file. "
+            "Dividing files into single-line chunks... "
+            "For performance gains, consider reducing "
+            "number of chunks."
         )
         num_chunks = total_lines
 
     n, r = divmod(total_lines, num_chunks)  # lines_per_chunk, leftovers
-    firsts = [
-        ((n + 1) * i, (n + 1) * (i + 1))
-        for i in range(r)
-    ]
+    firsts = [((n + 1) * i, (n + 1) * (i + 1)) for i in range(r)]
     last = firsts[-1][-1] if firsts else 0
-    seconds = [
-        (last + n * i, last + n * (i + 1))
-        for i in range(num_chunks - r)
-    ]
+    seconds = [(last + n * i, last + n * (i + 1)) for i in range(num_chunks - r)]
     return firsts + seconds
 
 
 @PartitioningStrategy(dataformat=SRA)
-def partition_chunks_strategy(
-    cloud_object: CloudObject,
-    num_chunks: int
-) -> list[SRASlice]:
-    logger.info('SRA partitioning started')
+def partition_chunks_strategy(cloud_object: CloudObject, num_chunks: int) -> list[SRASlice]:
+    logger.info("SRA partitioning started")
     total_lines = int(cloud_object.get_attribute("total_lines"))
 
     ranges = partition_into_ranges(total_lines, num_chunks)

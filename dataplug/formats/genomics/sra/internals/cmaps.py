@@ -24,16 +24,16 @@ from cdlml import get_var
 logger = logging.getLogger(__name__)
 
 
-libvdb_path = os.environ.get('NCBI_VDB_SO_PATH', '')
+libvdb_path = os.environ.get("NCBI_VDB_SO_PATH", "")
 
 
-_endianness = '<' if sys.byteorder == 'little' else '>'
-_uint64_t_fmt = _endianness + 'Q'
+_endianness = "<" if sys.byteorder == "little" else ">"
+_uint64_t_fmt = _endianness + "Q"
 _size_t_fmt = _endianness
 if sys.maxsize < 2**32:
-    _size_t_fmt += 'I'
+    _size_t_fmt += "I"
 else:
-    _size_t_fmt += 'Q'
+    _size_t_fmt += "Q"
 
 uint64_t_size = sizeof(c_uint64)
 
@@ -48,6 +48,7 @@ class ShmInfo(Structure):
 
 if TYPE_CHECKING:
     from ctypes import _Pointer
+
     ShmInfo_p: TypeAlias = _Pointer[ShmInfo]
 else:
     ShmInfo_p = POINTER(ShmInfo)
@@ -72,10 +73,7 @@ class NcbiVdbMapping:
             self.mmap_buf = get_var(self._lib, ShmInfo, "mmap_buf")
             self.pread_buf = get_var(self._lib, ShmInfo, "pread_buf")
         except AttributeError as e:
-            msg = (
-                f'Probably NCBI_VDB_SO_PATH environment variable is not set.\n'
-                f'[{e!s}]'
-            )
+            msg = f"Probably NCBI_VDB_SO_PATH environment variable is not set.\n[{e!s}]"
             raise AttributeError(msg) from e
 
     @property
@@ -112,11 +110,11 @@ def get_ncbi_vdb_mapping(libvdb_path: str | None = None) -> NcbiVdbMapping:
 
 
 def unpack_from(buf, pos, size=uint64_t_size, fmt=_uint64_t_fmt):
-    return struct.unpack(fmt, buf[pos:pos + size])[0]
+    return struct.unpack(fmt, buf[pos : pos + size])[0]
 
 
 def pack_to(buf, pos, val, size=uint64_t_size, fmt=_uint64_t_fmt):
-    buf[pos:pos + size] = struct.pack(fmt, val)
+    buf[pos : pos + size] = struct.pack(fmt, val)
 
 
 def ibuf_to_list(buf, length, total_size):
@@ -125,12 +123,7 @@ def ibuf_to_list(buf, length, total_size):
     idx = 0
     for _ in range(length // 2):
         pos = unpack_from(buf, idx)
-        size = unpack_from(
-            buf,
-            idx + sizeof(c_uint64),
-            size=sizeof(c_size_t),
-            fmt=_size_t_fmt
-        )
+        size = unpack_from(buf, idx + sizeof(c_uint64), size=sizeof(c_size_t), fmt=_size_t_fmt)
         # Additional 4 bytes for alignment purposes
         if pos + size + 4 < total_size:
             size += 4
@@ -144,7 +137,7 @@ def save_mmaps(mmaps, buf, total_size):
     nmmaps = unpack_from(buf, 0)
     if nmmaps == 0:
         return
-    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * nmmaps, total_size)
+    tuples = ibuf_to_list(buf[sizeof(c_uint64) :], 2 * nmmaps, total_size)
     mmaps.extend(tuples)
     pack_to(buf, 0, 0)
 
@@ -153,7 +146,7 @@ def save_preads(preads, buf, idx, total_size):
     npreads = unpack_from(buf, 0)
     if npreads == 0:
         return
-    tuples = ibuf_to_list(buf[sizeof(c_uint64):], 2 * npreads, total_size)
+    tuples = ibuf_to_list(buf[sizeof(c_uint64) :], 2 * npreads, total_size)
     preads[idx] = tuples
     pack_to(buf, 0, 0)
 
