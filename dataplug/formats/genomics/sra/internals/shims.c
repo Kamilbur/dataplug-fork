@@ -55,6 +55,21 @@ my_strlen(const char *str)
     return len;
 }
 
+char *
+my_basename(const char *path) {
+    const char *base = path;
+    const char *p = path;
+
+    while (*p != '\0') {
+        if (*p == '/') {
+            base = p + 1;
+        }
+        p++;
+    }
+    return (char *)base;
+}
+
+
 void
 safe_log(const char* msg)
 {
@@ -190,7 +205,7 @@ open_hook(const char *pathname, int flags)
 {
     if ( ! info.accession) return -1;
 
-    if (strcmp(basename(pathname), info.accession) == 0) {
+    if (strcmp(my_basename(pathname), info.accession) == 0) {
         safe_log("[interpose] opening special_fd\n");
         safe_log(info.accession);
         safe_log("\n");
@@ -336,22 +351,6 @@ fstat(int fd, struct stat *statbuf)
         }
     });
     return ret;
-}
-
-
-
-char *
-basename(const char *path) {
-    const char *base = path;
-    const char *p = path;
-
-    while (*p != '\0') {
-        if (*p == '/') {
-            base = p + 1;
-        }
-        p++;
-    }
-    return (char *)base;
 }
 
 
