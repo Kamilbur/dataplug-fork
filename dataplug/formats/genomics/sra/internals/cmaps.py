@@ -13,13 +13,13 @@ from ctypes import (
     c_size_t,
     c_uint64,
     c_void_p,
-    pointer,
-    sizeof,
 )
 from multiprocessing.managers import SharedMemoryManager
 from typing import TYPE_CHECKING, TypeAlias
 
 from cdlml import get_var
+
+from .cdlml_compat import pointer, sizeof
 
 logger = logging.getLogger(__name__)
 

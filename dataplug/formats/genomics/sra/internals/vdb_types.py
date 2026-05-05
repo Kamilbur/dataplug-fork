@@ -2,8 +2,8 @@ import ctypes as C
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .cdlml_compat import byref, cast
 from .vdb import vdb
-import cdlml
 
 
 def to_char_p(s):
@@ -75,7 +75,7 @@ class VColumn:
             self.name = name
 
     def update(self):
-        vdb.VCursorDatatype(self.cur, self.idx, cdlml.byref(self.tdec), cdlml.byref(self.tdes))
+        vdb.VCursorDatatype(self.cur, self.idx, byref(self.tdec), byref(self.tdes))
         (dict, dflt) = type_xf[self.tdes.domain]
         self.column_type = dict[self.tdes.bits]
         if self.column_type is None:
@@ -90,17 +90,17 @@ class VColumn:
             self.cur,
             row_id,
             self.idx,
-            cdlml.byref(elem_bits),
-            cdlml.byref(data),
+            byref(elem_bits),
+            byref(data),
             None,
-            cdlml.byref(row_len),
+            byref(row_len),
         )
         if self.column_type == C.c_char:
             tmp = C.string_at(data, row_len.value)
             if isinstance(tmp, bytes):
                 return tmp.decode("utf-8")
             return tmp
-        typed_ptr = C.cast(data, C.POINTER(self.column_type))
+        typed_ptr = cast(data, C.POINTER(self.column_type))
         e_count = row_len.value
         if elem_bits.value < 8:
             e_count *= elem_bits.value
@@ -110,5 +110,5 @@ class VColumn:
     def row_range(self):
         first = C.c_longlong()
         count = C.c_longlong()
-        vdb.VCursorIdRange(self.cur, self.idx, cdlml.byref(first), cdlml.byref(count))
+        vdb.VCursorIdRange(self.cur, self.idx, byref(first), byref(count))
         return (first.value, count.value)

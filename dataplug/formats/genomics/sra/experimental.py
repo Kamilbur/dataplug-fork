@@ -10,11 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cdlml import get_var, memmove, addressof
+from cdlml import get_var
 
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
+from .internals.cdlml_compat import addressof, memmove, sizeof
 from .internals.download import download_range, stream_to_bytes
 from .internals.interval import Interval, merge_intervals, partition_dry
 
@@ -59,9 +60,9 @@ class ShimsMapping:
 
     @info.setter
     def info(self, value):
-#        dst = addressof(self._info)
-#        src = addressof(value)
-        memmove(self._info, value, C.sizeof(FileInfo))
+        dst = addressof(self._info)
+        src = addressof(value)
+        memmove(dst, src, sizeof(FileInfo))
         self._keepalive = value
 
 

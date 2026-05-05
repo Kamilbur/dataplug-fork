@@ -2,8 +2,8 @@ import contextlib
 import ctypes as C
 
 from .vdb import vdb
+from .cdlml_compat import byref
 from .vdb_types import to_char_p
-import cdlml
 
 SRALines = list[tuple[str, ...]]
 
@@ -25,12 +25,12 @@ def _release(name, handle):
 
 def _open_table(mgr, path):
     tab = C.c_void_p()
-    if vdb.VDBManagerOpenTableRead(mgr, cdlml.byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
+    if vdb.VDBManagerOpenTableRead(mgr, byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
         return tab, None
     db = C.c_void_p()
-    if vdb.VDBManagerOpenDBRead(mgr, cdlml.byref(db), C.c_void_p(0), to_char_p(path)) != 0:
+    if vdb.VDBManagerOpenDBRead(mgr, byref(db), C.c_void_p(0), to_char_p(path)) != 0:
         raise ValueError("Not an SRA-object: " + path)
-    if vdb.VDatabaseOpenTableRead(db, cdlml.byref(tab), to_char_p("SEQUENCE")) == 0:
+    if vdb.VDatabaseOpenTableRead(db, byref(tab), to_char_p("SEQUENCE")) == 0:
         return tab, db
     _release("VDatabaseRelease", db)
     raise ValueError("Not an SRA-object: " + path)
@@ -40,10 +40,10 @@ def _open_cursor(path):
     nat_dir = C.c_void_p()
     mgr = C.c_void_p()
     cur = C.c_void_p()
-    vdb.KDirectoryNativeDir_v1(cdlml.byref(nat_dir))
-    vdb.VDBManagerMakeRead(cdlml.byref(mgr), nat_dir)
+    vdb.KDirectoryNativeDir_v1(byref(nat_dir))
+    vdb.VDBManagerMakeRead(byref(mgr), nat_dir)
     tab, db = _open_table(mgr, path)
-    vdb.VTableCreateCursorRead(tab, cdlml.byref(cur))
+    vdb.VTableCreateCursorRead(tab, byref(cur))
     return cur, tab, db, mgr, nat_dir
 
 
@@ -61,7 +61,7 @@ class VColumns:
         self.columns = []
         for name in _COLUMN_NAMES:
             idx = C.c_int()
-            vdb.VCursorAddColumn(cur, cdlml.byref(idx), to_char_p(name))
+            vdb.VCursorAddColumn(cur, byref(idx), to_char_p(name))
             self.columns.append(VColumn(idx.value, cur))
         vdb.VCursorOpen(cur)
         for col in self.columns:
