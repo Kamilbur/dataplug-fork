@@ -4,9 +4,9 @@ This is a local benchmark helper, not a pytest test.
 
 Examples:
     source venv/bin/activate
-    python3 tests/speedup_test.py
-    python3 tests/speedup_test.py --workers 1,2,3,5 --repeats 2
-    python3 tests/speedup_test.py --fixture tests/fixtures/sra/SRR19392985
+    python3 tests/speedup_test.py --s3-uri s3://test-sra/SRR19392985
+    python3 tests/speedup_test.py --s3-uri s3://test-sra/SRR19392985 --workers 1,2,3,5 --repeats 2
+    python3 tests/speedup_test.py --s3-uri s3://test-sra/SRR19392985 --s3-config-json '{"endpoint_url":"http://localhost:9000","region_name":"us-east-1","credentials":{"AccessKeyId":"minioadmin","SecretAccessKey":"minioadmin"}}'
 
 Outputs:
     benchmark_results/sra_speedup_raw.csv
@@ -28,12 +28,11 @@ from pathlib import Path
 from statistics import mean, stdev
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "sra" / "SRR32296234"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "benchmark_results"
 RAW_FIELDS = [
     "timestamp_utc",
     "accession",
-    "fixture",
+    "s3_uri",
     "size_bytes",
     "cpu_count",
     "workers",
@@ -50,7 +49,7 @@ RAW_FIELDS = [
 ]
 SUMMARY_FIELDS = [
     "accession",
-    "fixture",
+    "s3_uri",
     "size_bytes",
     "cpu_count",
     "workers",
@@ -102,19 +101,43 @@ def append_jsonl(path: Path, row: dict) -> None:
         f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def load_s3_config(args: argparse.Namespace) -> dict:
+    if args.s3_config_json:
+        return json.loads(args.s3_config_json)
+    if args.s3_config_file:
+        return json.loads(Path(args.s3_config_file).read_text(encoding="utf-8"))
+
+    config: dict = {}
+    if args.s3_endpoint:
+        config["endpoint_url"] = args.s3_endpoint
+    if args.s3_region:
+        config["region_name"] = args.s3_region
+    if bool(args.s3_access_key) != bool(args.s3_secret_key):
+        raise ValueError("--s3-access-key and --s3-secret-key must be provided together")
+    if args.s3_access_key and args.s3_secret_key:
+        credentials = {
+            "AccessKeyId": args.s3_access_key,
+            "SecretAccessKey": args.s3_secret_key,
+        }
+        if args.s3_session_token:
+            credentials["SessionToken"] = args.s3_session_token
+        config["credentials"] = credentials
+    if args.s3_unsigned:
+        config.setdefault("botocore_config_kwargs", {})["signature_version"] = "unsigned"
+    return config
+
+
 def child_run(args: argparse.Namespace) -> int:
-    sys.path.insert(0, str(REPO_ROOT / "tests"))
     sys.path.insert(0, str(REPO_ROOT))
 
-    from _local_storage import make_cloud_object
-
+    from dataplug import CloudObject
     import dataplug.formats.genomics.sra.experimental as exp
     from dataplug.formats.genomics.sra.internals.download import (
         parallel_download_to_buffer as real_download,
     )
 
-    fixture = Path(args.fixture).resolve()
-    accession = args.accession or fixture.name
+    s3_config = load_s3_config(args)
+    accession = args.accession or args.s3_uri.rstrip("/").split("/")[-1].split(".")[0]
     worker_count = int(args.workers)
 
     def download_with_worker_count(cloud_object):
@@ -122,7 +145,12 @@ def child_run(args: argparse.Namespace) -> int:
 
     exp.parallel_download_to_buffer = download_with_worker_count
 
-    co = make_cloud_object(exp.SRA, str(fixture), accession)
+    co = CloudObject.from_s3(
+        exp.SRA,
+        args.s3_uri,
+        metadata_bucket=args.metadata_bucket,
+        s3_config=s3_config,
+    )
     started = time.perf_counter()
     md = exp.preprocess_sra(co, step=args.step)
     elapsed = time.perf_counter() - started
@@ -144,8 +172,8 @@ def child_run(args: argparse.Namespace) -> int:
     row = {
         "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "accession": accession,
-        "fixture": str(fixture),
-        "size_bytes": fixture.stat().st_size,
+        "s3_uri": args.s3_uri,
+        "size_bytes": co.size,
         "cpu_count": os.cpu_count() or 1,
         "workers": worker_count,
         "repeat": args.repeat,
@@ -168,10 +196,12 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
         sys.executable,
         str(Path(__file__).resolve()),
         "--child-run",
-        "--fixture",
-        str(args.fixture),
+        "--s3-uri",
+        args.s3_uri,
         "--accession",
         args.accession,
+        "--metadata-bucket",
+        args.metadata_bucket,
         "--workers",
         str(workers),
         "--repeat",
@@ -179,6 +209,22 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
         "--step",
         str(args.step),
     ]
+    if args.s3_config_json:
+        cmd.extend(["--s3-config-json", args.s3_config_json])
+    if args.s3_config_file:
+        cmd.extend(["--s3-config-file", args.s3_config_file])
+    if args.s3_endpoint:
+        cmd.extend(["--s3-endpoint", args.s3_endpoint])
+    if args.s3_region:
+        cmd.extend(["--s3-region", args.s3_region])
+    if args.s3_access_key:
+        cmd.extend(["--s3-access-key", args.s3_access_key])
+    if args.s3_secret_key:
+        cmd.extend(["--s3-secret-key", args.s3_secret_key])
+    if args.s3_session_token:
+        cmd.extend(["--s3-session-token", args.s3_session_token])
+    if args.s3_unsigned:
+        cmd.append("--s3-unsigned")
     if args.expected_lines is not None:
         cmd.extend(["--expected-lines", str(args.expected_lines)])
 
@@ -199,8 +245,8 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
     return {
         "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "accession": args.accession,
-        "fixture": str(Path(args.fixture).resolve()),
-        "size_bytes": Path(args.fixture).resolve().stat().st_size,
+        "s3_uri": args.s3_uri,
+        "size_bytes": "",
         "cpu_count": os.cpu_count() or 1,
         "workers": workers,
         "repeat": repeat,
@@ -234,7 +280,7 @@ def summarize(rows: list[dict]) -> list[dict]:
         summary.append(
             {
                 "accession": row0["accession"],
-                "fixture": row0["fixture"],
+                "s3_uri": row0["s3_uri"],
                 "size_bytes": row0["size_bytes"],
                 "cpu_count": row0["cpu_count"],
                 "workers": workers,
@@ -257,8 +303,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Benchmark SRA preprocess_sra speedup across worker counts."
     )
-    parser.add_argument("--fixture", default=str(DEFAULT_FIXTURE), help="SRA fixture path")
-    parser.add_argument("--accession", default="", help="Accession name; default: fixture basename")
+    parser.add_argument("--s3-uri", required=True, help="SRA object URI, e.g. s3://bucket/SRR19392985")
+    parser.add_argument("--accession", default="", help="Accession name; default: S3 key basename")
+    parser.add_argument("--metadata-bucket", default="", help="Metadata bucket; default: data bucket + .meta")
+    parser.add_argument("--s3-config-json", default="", help="JSON dict passed as CloudObject s3_config")
+    parser.add_argument("--s3-config-file", default="", help="Path to JSON dict passed as CloudObject s3_config")
+    parser.add_argument("--s3-endpoint", default=os.getenv("S3_ENDPOINT", ""))
+    parser.add_argument("--s3-region", default=os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "")))
+    parser.add_argument("--s3-access-key", default=os.getenv("S3_ACCESS_KEY", os.getenv("AWS_ACCESS_KEY_ID", "")))
+    parser.add_argument("--s3-secret-key", default=os.getenv("S3_SECRET_KEY", os.getenv("AWS_SECRET_ACCESS_KEY", "")))
+    parser.add_argument("--s3-session-token", default=os.getenv("AWS_SESSION_TOKEN", ""))
+    parser.add_argument("--s3-unsigned", action="store_true", help="Use unsigned S3 requests")
     parser.add_argument("--workers", default="", help="Comma list, e.g. 1,2,3,5")
     parser.add_argument("--include-max", action="store_true", help="Include os.cpu_count() in default workers")
     parser.add_argument("--repeats", type=int, default=1, help="Runs per worker count")
@@ -269,9 +324,11 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    args.fixture = str(Path(args.fixture).resolve())
     if not args.accession:
-        args.accession = Path(args.fixture).name
+        args.accession = args.s3_uri.rstrip("/").split("/")[-1].split(".")[0]
+    if not args.metadata_bucket:
+        bucket = args.s3_uri.removeprefix("s3://").split("/", 1)[0]
+        args.metadata_bucket = bucket + ".meta"
     if args.repeats < 1:
         parser.error("--repeats must be >= 1")
     if args.step < 1:
@@ -279,6 +336,11 @@ def main() -> int:
 
     if args.child_run:
         return child_run(args)
+
+    try:
+        load_s3_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     cpu_count = os.cpu_count() or 1
     workers = parse_workers(args.workers, cpu_count)
@@ -291,8 +353,9 @@ def main() -> int:
     raw_jsonl = output_dir / "sra_speedup_raw.jsonl"
     summary_csv = output_dir / "sra_speedup_summary.csv"
 
-    print(f"fixture={args.fixture}")
+    print(f"s3_uri={args.s3_uri}")
     print(f"accession={args.accession}")
+    print(f"metadata_bucket={args.metadata_bucket}")
     print(f"cpu_count={cpu_count}")
     print(f"workers={workers}")
     print(f"repeats={args.repeats}")
