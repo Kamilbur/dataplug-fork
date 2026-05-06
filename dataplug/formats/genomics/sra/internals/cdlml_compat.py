@@ -13,16 +13,26 @@ def _is_carg(obj) -> bool:
     return type(obj).__name__ == "CArgObject"
 
 
+def _remote_cdll(cdll):
+    return getattr(cdll, "_cdll", cdll)
+
+
 def _contextual(name: str, obj, *extra, cdll=None):
     fn = getattr(cdlml, name, None)
     if fn is not None:
         attempts = [(obj, *extra)]
         if cdll is not None:
-            attempts.extend(((cdll, obj, *extra), (obj, *extra, cdll)))
+            remote = _remote_cdll(cdll)
+            attempts.extend(((remote, obj, *extra), (obj, *extra, remote)))
+            for keyword in ("cdll", "lib", "library", "server"):
+                attempts.append((obj, *extra, {keyword: remote}))
         fallback = None
         for args in attempts:
             try:
-                result = fn(*args)
+                if args and isinstance(args[-1], dict):
+                    result = fn(*args[:-1], **args[-1])
+                else:
+                    result = fn(*args)
             except TypeError:
                 continue
             fallback = result

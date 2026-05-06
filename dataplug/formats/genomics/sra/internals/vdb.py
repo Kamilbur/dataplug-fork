@@ -9,7 +9,32 @@ preloads = [
     Preload(name=b"libshims.so", path=str(_HERE / "libshims.so").encode(), alias="shims"),
 ]
 
-vdb = PreloadedCDLL(str(_HERE / "libncbi-vdb.so"), preloads=preloads)
+_cdll = PreloadedCDLL(str(_HERE / "libncbi-vdb.so"), preloads=preloads)
+
+
+class VdbCDLL:
+    def __init__(self, cdll):
+        self._cdll = cdll
+        self._funcs = {}
+
+    def __getitem__(self, name):
+        return self._cdll[name]
+
+    def __get_var__(self, name, ctype=C.c_int):
+        return self._cdll.__get_var__(name, ctype)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._funcs[name]
+        except KeyError:
+            func = getattr(self._cdll, name)
+            self._funcs[name] = func
+            return func
+
+
+vdb = VdbCDLL(_cdll)
 
 
 def _prototype(name, restype, argtypes):
