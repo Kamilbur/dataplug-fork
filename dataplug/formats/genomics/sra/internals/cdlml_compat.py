@@ -16,20 +16,15 @@ def _is_carg(obj) -> bool:
 def _contextual(name: str, obj, *extra, cdll=None):
     fn = getattr(cdlml, name, None)
     if fn is not None:
-        attempts = [(obj, *extra)]
         if cdll is not None:
-            attempts.extend(((cdll, obj, *extra), (obj, *extra, cdll)))
-        fallback = None
-        for args in attempts:
             try:
-                result = fn(*args)
+                return fn(obj, *extra, cdll=cdll)
             except TypeError:
-                continue
-            fallback = result
-            if cdll is None or hasattr(result, "_addr") or not _is_carg(result):
-                return result
-        if fallback is not None:
-            return fallback
+                pass
+
+        result = fn(obj, *extra)
+        if cdll is None or hasattr(result, "_addr") or not _is_carg(result):
+            return result
     return getattr(C, name)(obj, *extra)
 
 

@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import selectors
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ RAW_FIELDS = [
     "size_bytes",
     "cpu_count",
     "workers",
+    "walk_workers",
     "repeat",
     "step",
     "elapsed_s",
@@ -53,6 +55,7 @@ SUMMARY_FIELDS = [
     "size_bytes",
     "cpu_count",
     "workers",
+    "walk_workers",
     "runs",
     "step",
     "mean_elapsed_s",
@@ -151,9 +154,21 @@ def child_run(args: argparse.Namespace) -> int:
         metadata_bucket=args.metadata_bucket,
         s3_config=s3_config,
     )
+    print(
+        f"child start workers={worker_count} walk_workers={args.walk_workers} "
+        f"repeat={args.repeat} size_bytes={co.size} step={args.step}",
+        flush=True,
+    )
     started = time.perf_counter()
-    md = exp.preprocess_sra(co, step=args.step)
+    md = exp.preprocess_sra(
+        co,
+        step=args.step,
+        walk_workers=args.walk_workers,
+        walk_start_method=args.walk_start_method,
+        walk_overlap_steps=args.walk_overlap_steps,
+    )
     elapsed = time.perf_counter() - started
+    print(f"child done workers={worker_count} repeat={args.repeat} elapsed_s={elapsed:.6f}", flush=True)
 
     try:
         import resource
@@ -176,6 +191,7 @@ def child_run(args: argparse.Namespace) -> int:
         "size_bytes": co.size,
         "cpu_count": os.cpu_count() or 1,
         "workers": worker_count,
+        "walk_workers": args.walk_workers,
         "repeat": args.repeat,
         "step": args.step,
         "elapsed_s": round(elapsed, 6),
@@ -209,6 +225,9 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
         "--step",
         str(args.step),
     ]
+    cmd.extend(["--walk-workers", str(args.walk_workers)])
+    cmd.extend(["--walk-start-method", args.walk_start_method])
+    cmd.extend(["--walk-overlap-steps", str(args.walk_overlap_steps)])
     if args.s3_config_json:
         cmd.extend(["--s3-config-json", args.s3_config_json])
     if args.s3_config_file:
@@ -228,19 +247,52 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
     if args.expected_lines is not None:
         cmd.extend(["--expected-lines", str(args.expected_lines)])
 
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=REPO_ROOT,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        bufsize=1,
     )
-    if proc.returncode == 0:
-        for line in reversed(proc.stdout.splitlines()):
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                return json.loads(line)
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    json_row: dict | None = None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+    last_heartbeat = time.monotonic()
+
+    while selector.get_map():
+        events = selector.select(timeout=1.0)
+        if not events:
+            if proc.poll() is None and time.monotonic() - last_heartbeat >= args.heartbeat_interval:
+                print(f"still running workers={workers} repeat={repeat}", flush=True)
+                last_heartbeat = time.monotonic()
+            continue
+        for key, _ in events:
+            line = key.fileobj.readline()
+            if line == "":
+                selector.unregister(key.fileobj)
+                continue
+            stream_name = key.data
+            clean = line.rstrip("\n")
+            if stream_name == "stdout":
+                stdout_lines.append(clean)
+                if clean.startswith("{") and clean.endswith("}"):
+                    json_row = json.loads(clean)
+                else:
+                    print(f"[child stdout] {clean}", flush=True)
+            else:
+                stderr_lines.append(clean)
+                print(f"[child stderr] {clean}", flush=True)
+
+    returncode = proc.wait()
+    if returncode == 0 and json_row is not None:
+        return json_row
 
     return {
         "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -249,6 +301,7 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
         "size_bytes": "",
         "cpu_count": os.cpu_count() or 1,
         "workers": workers,
+        "walk_workers": args.walk_workers,
         "repeat": repeat,
         "step": args.step,
         "elapsed_s": "",
@@ -257,8 +310,8 @@ def run_child(args: argparse.Namespace, workers: int, repeat: int) -> dict:
         "pread_groups": "",
         "pread_intervals": "",
         "mmap_count": "",
-        "status": f"failed:{proc.returncode}",
-        "error": (proc.stderr.strip() or proc.stdout.strip())[-2000:],
+        "status": f"failed:{returncode}",
+        "error": ("\n".join(stderr_lines).strip() or "\n".join(stdout_lines).strip())[-2000:],
     }
 
 
@@ -284,6 +337,7 @@ def summarize(rows: list[dict]) -> list[dict]:
                 "size_bytes": row0["size_bytes"],
                 "cpu_count": row0["cpu_count"],
                 "workers": workers,
+                "walk_workers": row0["walk_workers"],
                 "runs": len(group),
                 "step": row0["step"],
                 "mean_elapsed_s": round(mean(elapsed), 6),
@@ -315,11 +369,15 @@ def main() -> int:
     parser.add_argument("--s3-session-token", default=os.getenv("AWS_SESSION_TOKEN", ""))
     parser.add_argument("--s3-unsigned", action="store_true", help="Use unsigned S3 requests")
     parser.add_argument("--workers", default="", help="Comma list, e.g. 1,2,3,5")
+    parser.add_argument("--walk-workers", type=int, default=1, help="Processes for VDB row-walk phase")
+    parser.add_argument("--walk-start-method", default="spawn", choices=("spawn", "fork", "forkserver"))
+    parser.add_argument("--walk-overlap-steps", type=int, default=0, help="Overlapped sampled rows per worker boundary")
     parser.add_argument("--include-max", action="store_true", help="Include os.cpu_count() in default workers")
     parser.add_argument("--repeats", type=int, default=1, help="Runs per worker count")
     parser.add_argument("--step", type=int, default=250, help="preprocess_sra sampling step")
-    parser.add_argument("--expected-lines", type=int, default=74671431)
+    parser.add_argument("--expected-lines", type=int, default=None)
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument("--heartbeat-interval", type=float, default=30.0, help="Seconds between parent progress pings")
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--repeat", type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -333,6 +391,10 @@ def main() -> int:
         parser.error("--repeats must be >= 1")
     if args.step < 1:
         parser.error("--step must be >= 1")
+    if args.walk_workers < 1:
+        parser.error("--walk-workers must be >= 1")
+    if args.walk_overlap_steps < 0:
+        parser.error("--walk-overlap-steps must be >= 0")
 
     if args.child_run:
         return child_run(args)
@@ -358,6 +420,9 @@ def main() -> int:
     print(f"metadata_bucket={args.metadata_bucket}")
     print(f"cpu_count={cpu_count}")
     print(f"workers={workers}")
+    print(f"walk_workers={args.walk_workers}")
+    print(f"walk_start_method={args.walk_start_method}")
+    print(f"walk_overlap_steps={args.walk_overlap_steps}")
     print(f"repeats={args.repeats}")
     print(f"raw_csv={raw_csv}")
     print(f"raw_jsonl={raw_jsonl}")
