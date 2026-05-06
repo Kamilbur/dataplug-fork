@@ -27,11 +27,12 @@ except (ImportError, RuntimeError):
 pytestmark = pytest.mark.skipif(not SRA_AVAILABLE, reason="vdb native library not available")
 
 CHUNK_COUNTS = [1, 5, 10, 20, 27]
+WALK_WORKERS = [1, 4]
 
 
-def _preprocess_and_partition(uri: str, num_chunks: int):
+def _preprocess_and_partition(uri: str, num_chunks: int, walk_workers: int):
     co = CloudObject.from_s3(SRA, uri, metadata_bucket=META_BUCKET)
-    co.preprocess()
+    co.preprocess(extra_args={"walk_workers": walk_workers}, force=True)
     return co.partition(partition_chunks_strategy, num_chunks=num_chunks)
 
 
@@ -62,10 +63,11 @@ def _collect_concat_records(chunks) -> list[str]:
 
 
 @pytest.mark.parametrize("s3_uri", sra_accessions_with_fixtures(), indirect=True)
-def test_output_is_chunk_count_invariant(s3_uri):
+@pytest.mark.parametrize("walk_workers", WALK_WORKERS)
+def test_output_is_chunk_count_invariant(s3_uri, walk_workers):
     """Concatenated output across all chunks must be identical regardless of chunk count."""
     co = CloudObject.from_s3(SRA, s3_uri, metadata_bucket=META_BUCKET)
-    co.preprocess()
+    co.preprocess(extra_args={"walk_workers": walk_workers}, force=True)
 
     all_records = {
         nc: _collect_concat_records(co.partition(partition_chunks_strategy, num_chunks=nc))
@@ -82,9 +84,10 @@ def test_output_is_chunk_count_invariant(s3_uri):
 
 
 @pytest.mark.parametrize("s3_uri", sra_accessions_with_fixtures(), indirect=True)
-def test_fastq_structure_is_valid(s3_uri):
+@pytest.mark.parametrize("walk_workers", WALK_WORKERS)
+def test_fastq_structure_is_valid(s3_uri, walk_workers):
     """Every output record must be a valid FASTQ quadruple."""
-    chunks = _preprocess_and_partition(s3_uri, num_chunks=5)
+    chunks = _preprocess_and_partition(s3_uri, num_chunks=5, walk_workers=walk_workers)
 
     for chunk in chunks:
         for reads in chunk.lazy_get():

@@ -483,29 +483,61 @@ def _walk_worker(args):
     return mmaps, preads
 
 
+def _total_lines_worker(args):
+    shm_name, data_size, acc, total_size = args
+
+    from .internals.sra import VColumns
+
+    shm = shared_memory.SharedMemory(name=shm_name)
+    buf = shm.buf
+    sv = _sv()
+    sv["dp_mode"].value = 0
+    sv["dp_sra_size"].value = total_size
+    sv["pread_ranges"][0] = 0
+    sv["mmap_ranges"][0] = 0
+
+    shims_mapping = ShimsMapping()
+    mask = EnabledMask()
+    try:
+        with mask.enabled_all(), temporary_sra(acc) as fpath:
+            shims_mapping.set_info_zerocopy(acc, buf, data_size, 0)
+            with VColumns.from_filepath(fpath) as vcols:
+                return len(vcols)
+    finally:
+        sv["dp_mode"].value = 0
+        shims_mapping.clear()
+        del buf
+        shm.close()
+
+
 def _walk_record_ranges_multiprocess(
     raw: bytearray,
     acc: str,
-    total_lines: int,
     step: int,
     total_size: int,
     workers: int,
     start_method: str,
     overlap_steps: int,
-) -> tuple[list[Interval], dict[int, list[Interval]]]:
-    sample_count = math.ceil(total_lines / step)
-    sample_tasks = _walk_sample_tasks(sample_count, workers, overlap_steps)
-    if not sample_tasks:
-        return [], {}
+) -> tuple[int, list[Interval], dict[int, list[Interval]]]:
 
     shm = shared_memory.SharedMemory(create=True, size=len(raw))
     try:
         shm.buf[: len(raw)] = raw
+        ctx = mp.get_context(start_method)
+        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+            total_lines = next(
+                pool.map(_total_lines_worker, [(shm.name, len(raw), acc, total_size)])
+            )
+
+        sample_count = math.ceil(total_lines / step)
+        sample_tasks = _walk_sample_tasks(sample_count, workers, overlap_steps)
+        if not sample_tasks:
+            return total_lines, [], {}
+
         tasks = []
         for start, end in sample_tasks:
             tasks.append((shm.name, len(raw), acc, total_size, step, start, end))
 
-        ctx = mp.get_context(start_method)
         mmaps: list[Interval] = []
         preads: dict[int, list[Interval]] = {}
         with ProcessPoolExecutor(max_workers=len(tasks), mp_context=ctx) as pool:
@@ -513,7 +545,7 @@ def _walk_record_ranges_multiprocess(
                 mmaps.extend(worker_mmaps)
                 for key, value in worker_preads.items():
                     preads.setdefault(key, []).extend(value)
-        return merge_intervals(mmaps), _merge_preads(preads)
+        return total_lines, merge_intervals(mmaps), _merge_preads(preads)
     finally:
         shm.close()
         shm.unlink()
@@ -541,6 +573,28 @@ def preprocess_sra(
 
     mmaps, preads = [], {}
 
+    if walk_workers > 1:
+        try:
+            total_lines, mmaps, preads = _walk_record_ranges_multiprocess(
+                raw,
+                acc,
+                step,
+                cloud_object.size,
+                walk_workers,
+                walk_start_method,
+                walk_overlap_steps,
+            )
+        finally:
+            del raw
+        return PreprocessingMetadata(
+            metadata=io.BytesIO(b"nempty"),
+            attributes={
+                "total_lines": total_lines,
+                "mmaps": mmaps,
+                "preads": preads,
+            },
+        )
+
     shims_mapping = ShimsMapping()
     mask = EnabledMask()
     try:
@@ -548,27 +602,6 @@ def preprocess_sra(
             shims_mapping.set_info_zerocopy(acc, raw, len(raw), 0)
             with VColumns.from_filepath(fpath) as vcols:
                 total_lines = len(vcols)
-                if walk_workers > 1:
-                    shims_mapping.clear()
-                    sv["dp_mode"].value = 0
-                    mmaps, preads = _walk_record_ranges_multiprocess(
-                        raw,
-                        acc,
-                        total_lines,
-                        step,
-                        cloud_object.size,
-                        walk_workers,
-                        walk_start_method,
-                        walk_overlap_steps,
-                    )
-                    return PreprocessingMetadata(
-                        metadata=io.BytesIO(b"nempty"),
-                        attributes={
-                            "total_lines": total_lines,
-                            "mmaps": mmaps,
-                            "preads": preads,
-                        },
-                    )
                 _walk_record_ranges(
                     vcols, total_lines, step, cloud_object.size, mmaps, preads
                 )
