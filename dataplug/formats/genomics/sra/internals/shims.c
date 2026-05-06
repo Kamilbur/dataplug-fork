@@ -109,6 +109,7 @@ enabling_variable(read);
 enabling_variable(pread);
 enabling_variable(mmap);
 enabling_variable(munmap);
+enabling_variable(lseek);
 
 
 int (*real_open)(const char *pathname, int flags, ...) = NULL;
@@ -118,6 +119,7 @@ ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
 ssize_t (*real_pread)(int fd, void *buf, size_t count, off_t offset) = NULL;
 void * (*real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
 int (*real_munmap)(void *addr, size_t length) = NULL;
+off_t (*real_lseek)(int fd, off_t offset, int whence) = NULL;
 
 
 void
@@ -130,6 +132,7 @@ init_real(void)
     init_real_function(pread);
     init_real_function(mmap);
     init_real_function(munmap);
+    init_real_function(lseek);
 
     char *il_str = getenv("INTERPOSE_LOG");
     if (il_str != NULL) {
@@ -182,6 +185,7 @@ open_needs_mode(int flags)
 
 
 int special_fd[10];
+off_t special_fd_offset[10];
 size_t sfd;
 struct file_info {
     const char *accession;
@@ -478,7 +482,10 @@ open_hook(const char *pathname, int flags)
         safe_log("[interpose] opening special_fd\n");
         safe_log(info.accession);
         safe_log("\n");
-        special_fd[sfd++] = real_open(pathname, flags);
+        if (sfd >= 10) return -1;
+        special_fd[sfd] = real_open(pathname, flags);
+        special_fd_offset[sfd] = 0;
+        sfd++;
         return special_fd[sfd - 1];
     }
     return -1;
@@ -543,7 +550,9 @@ close_hook(int fd)
     for (size_t i = 0; i < sfd; i++) {
         if (fd == special_fd[i]) {
             safe_log("[interpose] closing special_fd\n");
-            special_fd[i] = special_fd[--sfd];
+            size_t last = --sfd;
+            special_fd[i] = special_fd[last];
+            special_fd_offset[i] = special_fd_offset[last];
             return 0;
         }
     }
@@ -558,7 +567,7 @@ close(int fd)
     pthread_once(&init_once, init_real);
     if (!real_close) return -1;
 
-    if (! enable_open || ! hooks_enabled_for_thread()) {
+    if (! enable_close || ! hooks_enabled_for_thread()) {
         WITH_HOOK(ret = real_close(fd));
         return ret;
     }
@@ -624,6 +633,47 @@ fstat(int fd, struct stat *statbuf)
 
 
 ssize_t
+read_from_info(void *buf, size_t count, off_t offset)
+{
+    if ((size_t)offset >= info.size) return 0;
+
+    if (dp_mode == 0) {
+        size_t to_read = ((size_t)offset + count <= info.size) ? count : info.size - (size_t)offset;
+        memcpy(buf, info.data + offset, to_read);
+        return (ssize_t)to_read;
+    }
+
+    uint64_t nranges = pread_ranges[0];
+    for (uint64_t j = 0; j < nranges; j++) {
+        uint64_t buf_off   = pread_ranges[3 * j + 1];
+        uint64_t rng_start = pread_ranges[3 * j + 2];
+        uint64_t rng_end   = pread_ranges[3 * j + 3];
+        if (rng_start <= (uint64_t)offset && (uint64_t)offset < rng_end) {
+            size_t avail = (size_t)(rng_end - (uint64_t)offset);
+            size_t to_read = count < avail ? count : avail;
+            memcpy(buf, info.data + buf_off + ((size_t)offset - (size_t)rng_start), to_read);
+            return (ssize_t)to_read;
+        }
+    }
+    return -1;
+}
+
+ssize_t
+read_hook(int fd, void *buf, size_t count)
+{
+    if (sfd == 0) return -1;
+    for (size_t i = 0; i < sfd; i++) {
+        if (fd != special_fd[i]) continue;
+        ssize_t ret = read_from_info(buf, count, special_fd_offset[i]);
+        if (ret > 0) {
+            special_fd_offset[i] += ret;
+        }
+        return ret;
+    }
+    return -1;
+}
+
+ssize_t
 read(int fd, void *buf, size_t count)
 {
     ssize_t ret = -1;
@@ -642,7 +692,10 @@ read(int fd, void *buf, size_t count)
 
     WITH_HOOK({
         safe_log("[interpose] READ\n");
-        ret = real_read(fd, buf, count);
+        ret = read_hook(fd, buf, count);
+        if (ret == -1) {
+            ret = real_read(fd, buf, count);
+        }
     });
     return ret;
 }
@@ -656,9 +709,8 @@ pread_hook(int fd, void *buf, size_t count, off_t offset)
         if (fd != special_fd[i]) continue;
         safe_log("[interpose] pread on special_fd\n");
         if (dp_mode == 0) {
-            if ((size_t)offset >= info.size) return 0;
-            size_t to_read = ((size_t)offset + count <= info.size) ? count : info.size - (size_t)offset;
-            memcpy(buf, info.data + offset, to_read);
+            ssize_t ret = read_from_info(buf, count, offset);
+            if (ret <= 0) return ret;
             uint64_t idx = pread_ranges[0];
             if (idx < MAX_RANGES) {
                 pread_ranges[2 * idx + 1] = (uint64_t)offset;
@@ -667,21 +719,9 @@ pread_hook(int fd, void *buf, size_t count, off_t offset)
             } else {
                 pread_ranges_overflow = 1;
             }
-            return (ssize_t)to_read;
+            return ret;
         } else {
-            uint64_t nranges = pread_ranges[0];
-            for (uint64_t j = 0; j < nranges; j++) {
-                uint64_t buf_off   = pread_ranges[3 * j + 1];
-                uint64_t rng_start = pread_ranges[3 * j + 2];
-                uint64_t rng_end   = pread_ranges[3 * j + 3];
-                if (rng_start <= (uint64_t)offset && (uint64_t)offset < rng_end) {
-                    size_t avail = (size_t)(rng_end - (uint64_t)offset);
-                    size_t to_read = count < avail ? count : avail;
-                    memcpy(buf, info.data + buf_off + ((size_t)offset - (size_t)rng_start), to_read);
-                    return (ssize_t)to_read;
-                }
-            }
-            return -1;
+            return read_from_info(buf, count, offset);
         }
     }
     return -1;
@@ -708,6 +748,57 @@ pread(int fd, void *buf, size_t count, off_t offset)
         ret = pread_hook(fd, buf, count, offset);
         if (ret == -1) {
             ret = real_pread(fd, buf, count, offset);
+        }
+    });
+    return ret;
+}
+
+off_t
+lseek_hook(int fd, off_t offset, int whence)
+{
+    if (sfd == 0) return (off_t)-1;
+    for (size_t i = 0; i < sfd; i++) {
+        if (fd != special_fd[i]) continue;
+
+        off_t base;
+        if (whence == SEEK_SET) {
+            base = 0;
+        } else if (whence == SEEK_CUR) {
+            base = special_fd_offset[i];
+        } else if (whence == SEEK_END) {
+            base = (off_t)info.size;
+        } else {
+            return (off_t)-1;
+        }
+
+        off_t next = base + offset;
+        if (next < 0) return (off_t)-1;
+        special_fd_offset[i] = next;
+        return next;
+    }
+    return (off_t)-1;
+}
+
+off_t
+lseek(int fd, off_t offset, int whence)
+{
+    off_t ret = (off_t)-1;
+    pthread_once(&init_once, init_real);
+    if (!real_lseek) return (off_t)-1;
+
+    if (! enable_lseek || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real_lseek(fd, offset, whence));
+        return ret;
+    }
+    if (in_hook) {
+        return real_lseek(fd, offset, whence);
+    }
+
+    WITH_HOOK({
+        safe_log("[interpose] LSEEK\n");
+        ret = lseek_hook(fd, offset, whence);
+        if (ret == (off_t)-1) {
+            ret = real_lseek(fd, offset, whence);
         }
     });
     return ret;

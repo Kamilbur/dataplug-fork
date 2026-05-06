@@ -31,7 +31,7 @@ c_off_t = _types_map[sysconfig.get_config_var("SIZEOF_OFF_T")]
 MAX_RANGES = 1024
 _RangesArray = C.c_uint64 * (1 + MAX_RANGES * 3)
 
-_SYSCALLS = ["open", "close", "fstat", "read", "pread", "mmap", "munmap"]
+_SYSCALLS = ["open", "close", "fstat", "read", "pread", "mmap", "munmap", "lseek"]
 
 
 def _vdb():
