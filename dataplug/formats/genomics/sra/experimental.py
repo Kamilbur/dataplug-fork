@@ -15,7 +15,7 @@ from cdlml import get_var
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
-from .internals.download import download_range, stream_to_bytes
+from .internals.download import download_range, parallel_download_to_buffer, stream_to_bytes
 from .internals.interval import Interval, merge_intervals, partition_dry
 
 if TYPE_CHECKING:
@@ -70,6 +70,9 @@ class ShimsMapping:
         self._set_info = self._lib.dp_set_info_buffer
         self._set_info.argtypes = [C.c_char_p, C.c_char_p, C.c_size_t, C.c_size_t, c_off_t]
         self._set_info.restype = None
+        self._set_info_zc = self._lib.dp_set_info_zerocopy
+        self._set_info_zc.argtypes = [C.c_char_p, C.c_void_p, C.c_size_t, C.c_size_t, c_off_t]
+        self._set_info_zc.restype = None
         self._clear_info = self._lib.dp_clear_info
         self._clear_info.argtypes = []
         self._clear_info.restype = None
@@ -87,6 +90,21 @@ class ShimsMapping:
         self._keepalive = (accession, data)
         data_bytes = to_bytes(data)
         self._set_info(to_bytes(accession), data_bytes, len(data_bytes), size, offset)
+
+    def set_info_zerocopy(self, accession, data, size, offset=0):
+        """Pass `data` to the C shim without copying. `data` must outlive the
+        next clear() call; we keep a strong reference here.
+        """
+        self._keepalive = (accession, data)
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            buf = data if isinstance(data, bytearray) else bytearray(data)
+            ptr = (C.c_char * len(buf)).from_buffer(buf)
+            self._keepalive = (accession, buf, ptr)
+            addr = C.addressof(ptr)
+        else:
+            addr = data
+            buf = data
+        self._set_info_zc(to_bytes(accession), addr, len(buf), size, offset)
 
     def clear(self):
         self._clear_info()
@@ -198,6 +216,136 @@ def _build_range_buffer(cloud_object, mmaps, preads):
     return b"".join(chunks), mmap_entries, pread_entries
 
 
+def _walk_record_ranges_python(vcols, total_lines: int, step: int, total_size: int,
+                               mmaps: list, preads: dict) -> None:
+    """Walk every `step` rows, triggering VDB column reads (without
+    materializing data) and capturing the mmap/pread ranges that the shim
+    records for each row group.
+    """
+    import numpy as np
+
+    cur = vcols.columns[0].cur
+    col_idxs = tuple(C.c_int(col.idx) for col in vcols.columns)
+    elem_bits = C.c_int()
+    data = C.c_void_p()
+    row_len = C.c_int()
+    eb_ref = C.byref(elem_bits)
+    d_ref = C.byref(data)
+    rl_ref = C.byref(row_len)
+    rid = C.c_longlong(0)
+    cell = _vdb().VCursorCellDataDirect
+
+    sv = _sv()
+    mmap_arr = sv["mmap_ranges"]
+    pread_arr = sv["pread_ranges"]
+    mmap_view = np.frombuffer(mmap_arr, dtype=np.uint64)
+    pread_view = np.frombuffer(pread_arr, dtype=np.uint64)
+
+    def drain(arr_view) -> list:
+        count = int(arr_view[0])
+        if count == 0:
+            return []
+        body = arr_view[1 : 1 + 2 * count].reshape(-1, 2)
+        positions = body[:, 0]
+        sizes = body[:, 1].copy()
+        room = positions + sizes + 4 < total_size
+        sizes[room] += 4
+        ends = positions + sizes
+        result = list(zip(positions.tolist(), ends.tolist()))
+        arr_view[0] = 0
+        return result
+
+    mmaps.extend(drain(mmap_view))
+    initial_pread = drain(pread_view)
+    if initial_pread:
+        preads[-1] = initial_pread
+
+    i = 0
+    row_idx = 1
+    while row_idx <= total_lines:
+        rid.value = row_idx
+        for ci in col_idxs:
+            cell(cur, rid, ci, eb_ref, d_ref, None, rl_ref)
+        m = drain(mmap_view)
+        if m:
+            mmaps.extend(m)
+        p = drain(pread_view)
+        if p:
+            preads[i * step] = p
+        i += 1
+        row_idx += step
+
+
+def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
+                          mmaps: list, preads: dict) -> bool:
+    import numpy as np
+
+    lib = _vdb()["shims"]
+    try:
+        walk = lib.dp_walk_columns
+        clear = lib.dp_clear_walk_ranges
+        pread_count = lib.dp_walk_pread_count
+        pread_data = lib.dp_walk_pread_data
+        mmap_count = lib.dp_walk_mmap_count
+        mmap_data = lib.dp_walk_mmap_data
+    except AttributeError:
+        return False
+
+    walk.argtypes = [
+        C.c_void_p,
+        C.POINTER(C.c_int),
+        C.c_size_t,
+        C.c_longlong,
+        C.c_longlong,
+        C.c_uint64,
+    ]
+    walk.restype = C.c_int
+    clear.argtypes = []
+    clear.restype = None
+    pread_count.argtypes = []
+    pread_count.restype = C.c_size_t
+    pread_data.argtypes = []
+    pread_data.restype = C.POINTER(C.c_uint64)
+    mmap_count.argtypes = []
+    mmap_count.restype = C.c_size_t
+    mmap_data.argtypes = []
+    mmap_data.restype = C.POINTER(C.c_uint64)
+
+    col_idxs = (C.c_int * len(vcols.columns))(*(col.idx for col in vcols.columns))
+    rc = walk(vcols.cur, col_idxs, len(col_idxs), total_lines, step, total_size)
+    if rc == -10:
+        clear()
+        return False
+    if rc != 0:
+        clear()
+        raise RuntimeError(f"dp_walk_columns failed with rc={rc}")
+
+    uint64_max = (1 << 64) - 1
+    try:
+        mc = mmap_count()
+        if mc:
+            arr = np.ctypeslib.as_array(mmap_data(), shape=(mc * 2,)).reshape(-1, 2)
+            mmaps.extend((int(row[0]), int(row[1])) for row in arr)
+
+        pc = pread_count()
+        if pc:
+            arr = np.ctypeslib.as_array(pread_data(), shape=(pc * 3,)).reshape(-1, 3)
+            for row in arr:
+                key = int(row[0])
+                idx = -1 if key == uint64_max else int(key)
+                preads.setdefault(idx, []).append((int(row[1]), int(row[2])))
+    finally:
+        clear()
+    return True
+
+
+def _walk_record_ranges(vcols, total_lines: int, step: int, total_size: int,
+                         mmaps: list, preads: dict) -> None:
+    if _walk_record_ranges_c(vcols, total_lines, step, total_size, mmaps, preads):
+        return
+    _walk_record_ranges_python(vcols, total_lines, step, total_size, mmaps, preads)
+
+
 def preprocess_sra(cloud_object: CloudObject, step=250):
     from .internals.sra import VColumns
 
@@ -210,7 +358,7 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
     sv["mmap_ranges"][0] = 0
 
     acc = accession(cloud_object)
-    raw = _download_to_bytes(cloud_object)
+    raw = parallel_download_to_buffer(cloud_object)
 
     shims_mapping = ShimsMapping()
     mask = EnabledMask()
@@ -218,18 +366,16 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
 
     try:
         with mask.enabled_all(), temporary_sra(acc) as fpath:
-            shims_mapping.set_info(acc, raw, len(raw), 0)
+            shims_mapping.set_info_zerocopy(acc, raw, len(raw), 0)
             with VColumns.from_filepath(fpath) as vcols:
                 total_lines = len(vcols)
-                _save_mmaps(mmaps, cloud_object.size)
-                _save_preads(preads, -1, cloud_object.size)
-                for i, row_idx in enumerate(range(1, total_lines + 1, step)):
-                    [col.read(row_idx) for col in vcols.columns]
-                    _save_mmaps(mmaps, cloud_object.size)
-                    _save_preads(preads, i * step, cloud_object.size)
+                _walk_record_ranges(
+                    vcols, total_lines, step, cloud_object.size, mmaps, preads
+                )
     finally:
         sv["dp_mode"].value = 0
         shims_mapping.clear()
+        del raw
 
     return PreprocessingMetadata(
         metadata=io.BytesIO(b"nempty"),

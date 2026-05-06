@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <limits.h>
 
 
 bool INTERPOSE_LOG = 0;
@@ -199,14 +200,198 @@ size_t dp_sra_size = 0;
 #define MAX_RANGES 1024
 uint64_t pread_ranges[1 + MAX_RANGES * 3];
 uint64_t mmap_ranges[1 + MAX_RANGES * 3];
+static int pread_ranges_overflow = 0;
+static int mmap_ranges_overflow = 0;
+
+static uint64_t *walk_preads = NULL;
+static size_t walk_pread_count = 0;
+static size_t walk_pread_cap = 0;
+static uint64_t *walk_mmaps = NULL;
+static size_t walk_mmap_count = 0;
+static size_t walk_mmap_cap = 0;
+
+typedef int32_t (*VCursorCellDataDirect_f)(
+    const void *self,
+    int64_t row_id,
+    uint32_t col_idx,
+    uint32_t *elem_bits,
+    const void **base,
+    uint32_t *boff,
+    uint32_t *row_len
+);
+static VCursorCellDataDirect_f real_VCursorCellDataDirect = NULL;
 
 static void *mmap_allocated[128];
 static size_t n_mmap_allocated = 0;
 
 
 void
+dp_clear_walk_ranges(void)
+{
+    free(walk_preads);
+    free(walk_mmaps);
+    walk_preads = NULL;
+    walk_mmaps = NULL;
+    walk_pread_count = 0;
+    walk_mmap_count = 0;
+    walk_pread_cap = 0;
+    walk_mmap_cap = 0;
+}
+
+
+size_t
+dp_walk_pread_count(void)
+{
+    return walk_pread_count;
+}
+
+
+uint64_t *
+dp_walk_pread_data(void)
+{
+    return walk_preads;
+}
+
+
+size_t
+dp_walk_mmap_count(void)
+{
+    return walk_mmap_count;
+}
+
+
+uint64_t *
+dp_walk_mmap_data(void)
+{
+    return walk_mmaps;
+}
+
+
+static int
+append_pread(uint64_t row_key, uint64_t start, uint64_t end)
+{
+    if (walk_pread_count == walk_pread_cap) {
+        size_t next_cap = walk_pread_cap ? walk_pread_cap * 2 : 4096;
+        if (next_cap > SIZE_MAX / (3 * sizeof(uint64_t))) return -1;
+        uint64_t *next = realloc(walk_preads, next_cap * 3 * sizeof(uint64_t));
+        if (!next) return -1;
+        walk_preads = next;
+        walk_pread_cap = next_cap;
+    }
+    size_t idx = walk_pread_count * 3;
+    walk_preads[idx] = row_key;
+    walk_preads[idx + 1] = start;
+    walk_preads[idx + 2] = end;
+    walk_pread_count++;
+    return 0;
+}
+
+
+static int
+append_mmap(uint64_t start, uint64_t end)
+{
+    if (walk_mmap_count == walk_mmap_cap) {
+        size_t next_cap = walk_mmap_cap ? walk_mmap_cap * 2 : 128;
+        if (next_cap > SIZE_MAX / (2 * sizeof(uint64_t))) return -1;
+        uint64_t *next = realloc(walk_mmaps, next_cap * 2 * sizeof(uint64_t));
+        if (!next) return -1;
+        walk_mmaps = next;
+        walk_mmap_cap = next_cap;
+    }
+    size_t idx = walk_mmap_count * 2;
+    walk_mmaps[idx] = start;
+    walk_mmaps[idx + 1] = end;
+    walk_mmap_count++;
+    return 0;
+}
+
+
+static int
+drain_walk_ranges(uint64_t row_key, uint64_t total_size)
+{
+    if (pread_ranges_overflow || mmap_ranges_overflow) {
+        return -2;
+    }
+
+    uint64_t mmap_count = mmap_ranges[0];
+    for (uint64_t i = 0; i < mmap_count; i++) {
+        uint64_t pos = mmap_ranges[2 * i + 1];
+        uint64_t size = mmap_ranges[2 * i + 2];
+        if (pos + size + 4 < total_size) size += 4;
+        if (append_mmap(pos, pos + size) != 0) return -1;
+    }
+    mmap_ranges[0] = 0;
+
+    uint64_t pread_count = pread_ranges[0];
+    for (uint64_t i = 0; i < pread_count; i++) {
+        uint64_t pos = pread_ranges[2 * i + 1];
+        uint64_t size = pread_ranges[2 * i + 2];
+        if (pos + size + 4 < total_size) size += 4;
+        if (append_pread(row_key, pos, pos + size) != 0) return -1;
+    }
+    pread_ranges[0] = 0;
+    return 0;
+}
+
+
+int
+dp_walk_columns(
+    void *cur,
+    const int *col_idxs,
+    size_t n_cols,
+    int64_t total_lines,
+    int64_t step,
+    uint64_t total_size
+)
+{
+    pthread_once(&init_once, init_real);
+    if (!real_VCursorCellDataDirect) {
+        real_VCursorCellDataDirect = (VCursorCellDataDirect_f)dlsym(
+            RTLD_DEFAULT, "VCursorCellDataDirect"
+        );
+    }
+    if (!real_VCursorCellDataDirect || !cur || !col_idxs || step <= 0) {
+        return -10;
+    }
+
+    dp_clear_walk_ranges();
+    pread_ranges_overflow = 0;
+    mmap_ranges_overflow = 0;
+
+    int rc = drain_walk_ranges(UINT64_MAX, total_size);
+    if (rc != 0) return rc;
+
+    uint32_t elem_bits = 0;
+    const void *data = NULL;
+    uint32_t row_len = 0;
+    uint64_t group_idx = 0;
+    for (int64_t row_idx = 1; row_idx <= total_lines; row_idx += step) {
+        for (size_t ci = 0; ci < n_cols; ci++) {
+            rc = real_VCursorCellDataDirect(
+                cur,
+                row_idx,
+                (uint32_t)col_idxs[ci],
+                &elem_bits,
+                &data,
+                NULL,
+                &row_len
+            );
+            if (rc != 0) {
+                return rc;
+            }
+        }
+        rc = drain_walk_ranges(group_idx * (uint64_t)step, total_size);
+        if (rc != 0) return rc;
+        group_idx++;
+    }
+    return 0;
+}
+
+
+void
 dp_clear_info(void)
 {
+    dp_clear_walk_ranges();
     free(owned_accession);
     free(owned_data);
     owned_accession = NULL;
@@ -241,6 +426,35 @@ dp_set_info_buffer(const char *accession, const char *data, size_t data_size, si
 
     info.accession = owned_accession;
     info.data = owned_data;
+    info.data_size = data_size;
+    info.size = size;
+    info.offset = offset;
+}
+
+
+/*
+ * Zero-copy variant: caller retains ownership of `data` and guarantees its
+ * lifetime exceeds the next dp_clear_info() call. Avoids the 1x file-size
+ * malloc+memcpy of dp_set_info_buffer, which is critical when the SRA file
+ * is multi-GB and process RSS would otherwise double.
+ */
+void
+dp_set_info_zerocopy(const char *accession, const char *data, size_t data_size, size_t size, off_t offset)
+{
+    dp_clear_info();
+    if (!accession || !data) {
+        return;
+    }
+
+    size_t acc_len = my_strlen(accession);
+    owned_accession = malloc(acc_len + 1);
+    if (!owned_accession) {
+        return;
+    }
+    memcpy(owned_accession, accession, acc_len + 1);
+
+    info.accession = owned_accession;
+    info.data = data;
     info.data_size = data_size;
     info.size = size;
     info.offset = offset;
@@ -449,6 +663,8 @@ pread_hook(int fd, void *buf, size_t count, off_t offset)
                 pread_ranges[2 * idx + 1] = (uint64_t)offset;
                 pread_ranges[2 * idx + 2] = (uint64_t)count;
                 pread_ranges[0] = idx + 1;
+            } else {
+                pread_ranges_overflow = 1;
             }
             return (ssize_t)to_read;
         } else {
@@ -510,6 +726,8 @@ mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                 mmap_ranges[2 * idx + 1] = (uint64_t)offset;
                 mmap_ranges[2 * idx + 2] = (uint64_t)length;
                 mmap_ranges[0] = idx + 1;
+            } else {
+                mmap_ranges_overflow = 1;
             }
             return info.data + offset;
         } else {
