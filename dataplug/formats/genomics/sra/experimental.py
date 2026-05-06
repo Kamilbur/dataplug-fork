@@ -15,7 +15,6 @@ from cdlml import get_var
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
-from .internals.cdlml_compat import addressof, memmove, sizeof
 from .internals.download import download_range, stream_to_bytes
 from .internals.interval import Interval, merge_intervals, partition_dry
 
@@ -50,20 +49,48 @@ class FileInfo(C.Structure):
     )
 
 
+def to_bytes(value, size: int | None = None) -> bytes:
+    if isinstance(value, bytes):
+        return value if size is None else value[:size]
+    if isinstance(value, str):
+        data = value.encode()
+        return data if size is None else data[:size]
+    if isinstance(value, C.c_char_p):
+        if size is None:
+            return value.value or b""
+        return C.string_at(value, size)
+    if size is None:
+        return bytes(value)
+    return C.string_at(value, size)
+
+
 class ShimsMapping:
     def __init__(self):
-        self._info = get_var(_vdb()["shims"], FileInfo, "info")
+        self._lib = _vdb()["shims"]
+        self._set_info = self._lib.dp_set_info_buffer
+        self._set_info.argtypes = [C.c_char_p, C.c_char_p, C.c_size_t, C.c_size_t, c_off_t]
+        self._set_info.restype = None
+        self._clear_info = self._lib.dp_clear_info
+        self._clear_info.argtypes = []
+        self._clear_info.restype = None
 
     @property
     def info(self):
-        return self._info
+        return get_var(self._lib, FileInfo, "info")
 
     @info.setter
     def info(self, value):
-        dst = addressof(self._info)
-        src = addressof(value)
-        memmove(dst, src, sizeof(FileInfo))
         self._keepalive = value
+        self.set_info(value.accession, value.data, value.size, value.offset)
+
+    def set_info(self, accession, data, size, offset=0):
+        self._keepalive = (accession, data)
+        data_bytes = to_bytes(data)
+        self._set_info(to_bytes(accession), data_bytes, len(data_bytes), size, offset)
+
+    def clear(self):
+        self._clear_info()
+        self._keepalive = None
 
 
 class EnabledMask:
@@ -173,7 +200,6 @@ def _build_range_buffer(cloud_object, mmaps, preads):
 
 def preprocess_sra(cloud_object: CloudObject, step=250):
     from .internals.sra import VColumns
-    from .internals.vdb_types import to_char_p
 
     logger.info("Preprocessing sra started")
 
@@ -192,12 +218,7 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
 
     try:
         with mask.enabled_all(), temporary_sra(acc) as fpath:
-            shims_mapping.info = FileInfo(
-                accession=to_char_p(acc),
-                data=to_char_p(raw),
-                size=len(raw),
-                offset=0,
-            )
+            shims_mapping.set_info(acc, raw, len(raw), 0)
             with VColumns.from_filepath(fpath) as vcols:
                 total_lines = len(vcols)
                 _save_mmaps(mmaps, cloud_object.size)
@@ -208,6 +229,7 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
                     _save_preads(preads, i * step, cloud_object.size)
     finally:
         sv["dp_mode"].value = 0
+        shims_mapping.clear()
 
     return PreprocessingMetadata(
         metadata=io.BytesIO(b"nempty"),
@@ -247,7 +269,6 @@ class SRASlice(CloudObjectSlice):
 
     def partial_download(self, split=False) -> SRALines:
         from .internals.sra import VColumns, _format_spot
-        from .internals.vdb_types import to_char_p
 
         acc = accession(self.cloud_object)
         raw, mmap_entries, pread_entries = _build_range_buffer(
@@ -264,18 +285,14 @@ class SRASlice(CloudObjectSlice):
 
         try:
             with mask.enabled_all(), temporary_sra(acc) as fpath:
-                shims_mapping.info = FileInfo(
-                    accession=to_char_p(acc),
-                    data=to_char_p(raw),
-                    size=self.cloud_object.size,
-                    offset=0,
-                )
+                shims_mapping.set_info(acc, raw, self.cloud_object.size, 0)
                 with VColumns.from_filepath(fpath) as vcols:
                     for row_idx in range(self.start + 1, self.end + 1):
                         row = [col.read(row_idx) for col in vcols.columns]
                         yield _format_spot(acc, row_idx, *row, split=split)
         finally:
             sv["dp_mode"].value = 0
+            shims_mapping.clear()
 
     def get(self, split=False) -> SRALines:
         return list(self.partial_download(split=split))

@@ -185,9 +185,13 @@ size_t sfd;
 struct file_info {
     const char *accession;
     const char *data;
+    size_t data_size;
     size_t size;
     off_t offset;
 } info;
+
+static char *owned_accession = NULL;
+static char *owned_data = NULL;
 
 int dp_mode = 0;
 size_t dp_sra_size = 0;
@@ -198,6 +202,56 @@ uint64_t mmap_ranges[1 + MAX_RANGES * 3];
 
 static void *mmap_allocated[128];
 static size_t n_mmap_allocated = 0;
+
+
+void
+dp_clear_info(void)
+{
+    free(owned_accession);
+    free(owned_data);
+    owned_accession = NULL;
+    owned_data = NULL;
+    info.accession = NULL;
+    info.data = NULL;
+    info.data_size = 0;
+    info.size = 0;
+    info.offset = 0;
+    sfd = 0;
+}
+
+
+void
+dp_set_info_buffer(const char *accession, const char *data, size_t data_size, size_t size, off_t offset)
+{
+    dp_clear_info();
+    if (!accession || !data) {
+        return;
+    }
+
+    size_t acc_len = my_strlen(accession);
+    owned_accession = malloc(acc_len + 1);
+    owned_data = malloc(data_size);
+    if (!owned_accession || !owned_data) {
+        dp_clear_info();
+        return;
+    }
+
+    memcpy(owned_accession, accession, acc_len + 1);
+    memcpy(owned_data, data, data_size);
+
+    info.accession = owned_accession;
+    info.data = owned_data;
+    info.data_size = data_size;
+    info.size = size;
+    info.offset = offset;
+}
+
+
+void
+dp_set_info(const char *accession, const char *data, size_t size, off_t offset)
+{
+    dp_set_info_buffer(accession, data, size, size, offset);
+}
 
 
 int
