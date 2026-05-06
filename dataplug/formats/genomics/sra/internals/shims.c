@@ -115,6 +115,9 @@ enabling_variable(lseek);
 int (*real_open)(const char *pathname, int flags, ...) = NULL;
 int (*real_close)(int fd) = NULL;
 int (*real_fstat)(int fd, struct stat *statbuf) = NULL;
+int (*real_fstat64)(int fd, struct stat64 *statbuf) = NULL;
+int (*real___fxstat)(int ver, int fd, struct stat *statbuf) = NULL;
+int (*real___fxstat64)(int ver, int fd, struct stat64 *statbuf) = NULL;
 ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
 ssize_t (*real_pread)(int fd, void *buf, size_t count, off_t offset) = NULL;
 void * (*real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
@@ -128,6 +131,9 @@ init_real(void)
     init_real_function(open);
     init_real_function(close);
     init_real_function(fstat);
+    init_real_function(fstat64);
+    init_real_function(__fxstat);
+    init_real_function(__fxstat64);
     init_real_function(read);
     init_real_function(pread);
     init_real_function(mmap);
@@ -605,6 +611,24 @@ fstat_hook(int fd, struct stat *statbuf)
 }
 
 int
+fstat64_hook(int fd, struct stat64 *statbuf)
+{
+    if (sfd == 0) return -1;
+    for (size_t i = 0; i < sfd; i++) {
+        if (fd == special_fd[i]) {
+            memset(statbuf, 0, sizeof(*statbuf));
+            statbuf->st_mode = S_IFREG | 0644;
+            statbuf->st_nlink = 1;
+            statbuf->st_size = (off_t)info.size;
+            statbuf->st_blksize = 4096;
+            statbuf->st_blocks = (statbuf->st_size + 511) / 512;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int
 fstat(int fd, struct stat *statbuf)
 {
     int ret = -1;
@@ -626,6 +650,84 @@ fstat(int fd, struct stat *statbuf)
         ret = fstat_hook(fd, statbuf);
         if (ret == -1) {
             ret = real_fstat(fd, statbuf);
+        }
+    });
+    return ret;
+}
+
+int
+fstat64(int fd, struct stat64 *statbuf)
+{
+    int ret = -1;
+    pthread_once(&init_once, init_real);
+    if (!real_fstat64) return -1;
+
+    if (! enable_fstat || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real_fstat64(fd, statbuf));
+        return ret;
+    }
+    if (in_hook) {
+        safe_log("[interpose] [in_hook] FSTAT64\n");
+        return real_fstat64(fd, statbuf);
+    }
+
+    WITH_HOOK({
+        safe_log("[interpose] FSTAT64\n");
+        ret = fstat64_hook(fd, statbuf);
+        if (ret == -1) {
+            ret = real_fstat64(fd, statbuf);
+        }
+    });
+    return ret;
+}
+
+int
+__fxstat(int ver, int fd, struct stat *statbuf)
+{
+    int ret = -1;
+    pthread_once(&init_once, init_real);
+    if (!real___fxstat) return -1;
+
+    if (! enable_fstat || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real___fxstat(ver, fd, statbuf));
+        return ret;
+    }
+    if (in_hook) {
+        safe_log("[interpose] [in_hook] __FXSTAT\n");
+        return real___fxstat(ver, fd, statbuf);
+    }
+
+    WITH_HOOK({
+        safe_log("[interpose] __FXSTAT\n");
+        ret = fstat_hook(fd, statbuf);
+        if (ret == -1) {
+            ret = real___fxstat(ver, fd, statbuf);
+        }
+    });
+    return ret;
+}
+
+int
+__fxstat64(int ver, int fd, struct stat64 *statbuf)
+{
+    int ret = -1;
+    pthread_once(&init_once, init_real);
+    if (!real___fxstat64) return -1;
+
+    if (! enable_fstat || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real___fxstat64(ver, fd, statbuf));
+        return ret;
+    }
+    if (in_hook) {
+        safe_log("[interpose] [in_hook] __FXSTAT64\n");
+        return real___fxstat64(ver, fd, statbuf);
+    }
+
+    WITH_HOOK({
+        safe_log("[interpose] __FXSTAT64\n");
+        ret = fstat64_hook(fd, statbuf);
+        if (ret == -1) {
+            ret = real___fxstat64(ver, fd, statbuf);
         }
     });
     return ret;
@@ -821,7 +923,7 @@ mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             } else {
                 mmap_ranges_overflow = 1;
             }
-            return info.data + offset;
+            return (void *)(info.data + offset);
         } else {
             uint64_t nranges = mmap_ranges[0];
             for (uint64_t j = 0; j < nranges; j++) {
