@@ -37,6 +37,7 @@ geospatial = [
     "PDAL"
 ]
 sra = ["dataplug-sra-native @ file:./sra_native"]
+mgb = ["dataplug-genie-native @ file:./genie_native"]
 dev = ["pytest", "moto[s3]"]
 
 
@@ -48,6 +49,16 @@ include = ["dataplug*"]
 
 [tool.setuptools.package-data]
 "dataplug.formats.genomics.sra.internals" = ["libncbi-vdb.so", "libshims.so"]
+"dataplug.formats.genomics.mgb.internals" = [
+    "libgenie.so",
+    "libmgbshims.so",
+    "libbsc.so",
+    "libzstd.so",
+    "liblzma.so",
+    "libhts.so",
+    "libz.so",
+    "libbz2.so",
+]
 
 [tool.black]
 line-length = 119
