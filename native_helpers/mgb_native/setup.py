@@ -101,21 +101,43 @@ def _extract_tarball(archive: Path, dst: Path):
 def _env() -> dict[str, str]:
     env = os.environ.copy()
     include = _INSTALL / "include"
-    lib = _INSTALL / "lib"
-    pkg_config = lib / "pkgconfig"
+    lib_dirs = _lib_dirs()
+    pkg_config_dirs = [lib / "pkgconfig" for lib in lib_dirs]
     env["CPPFLAGS"] = f"-I{include} " + env.get("CPPFLAGS", "")
     env["CFLAGS"] = f"-fPIC -I{include} " + env.get("CFLAGS", "")
     env["CXXFLAGS"] = f"-fPIC -I{include} -I{include / 'libbsc'} " + env.get("CXXFLAGS", "")
-    env["LDFLAGS"] = f"-L{lib} -Wl,-rpath,{lib} " + env.get("LDFLAGS", "")
-    env["PKG_CONFIG_PATH"] = f"{pkg_config}:{env.get('PKG_CONFIG_PATH', '')}"
-    env["LD_LIBRARY_PATH"] = f"{lib}:{env.get('LD_LIBRARY_PATH', '')}"
+    env["LDFLAGS"] = " ".join(f"-L{lib} -Wl,-rpath,{lib}" for lib in lib_dirs) + " " + env.get("LDFLAGS", "")
+    env["PKG_CONFIG_PATH"] = ":".join(str(path) for path in pkg_config_dirs) + f":{env.get('PKG_CONFIG_PATH', '')}"
+    env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in lib_dirs) + f":{env.get('LD_LIBRARY_PATH', '')}"
     return env
 
 
+def _primary_lib_dir() -> Path:
+    return _INSTALL / "lib"
+
+
+def _lib_dirs() -> list[Path]:
+    return [_INSTALL / "lib", _INSTALL / "lib64"]
+
+
 def _lib(name: str) -> Path:
-    for candidate in (_INSTALL / "lib").glob(name):
-        return candidate
-    raise RuntimeError(f"required library not found: {_INSTALL / 'lib' / name}")
+    for lib_dir in _lib_dirs():
+        for candidate in lib_dir.glob(name):
+            return candidate
+    raise RuntimeError(f"required library not found: {name} in {_lib_dirs()}")
+
+
+def _lib_exists(name: str) -> bool:
+    return any(lib_dir.joinpath(name).exists() for lib_dir in _lib_dirs())
+
+
+def _copy_first_lib(pattern: str, dst: Path, missing_msg: str) -> None:
+    for lib_dir in _lib_dirs():
+        libs = sorted(lib_dir.glob(pattern))
+        if libs:
+            shutil.copy2(libs[-1], dst)
+            return
+    raise RuntimeError(missing_msg)
 
 
 def _plain_so_name(path: Path) -> str:
@@ -142,8 +164,7 @@ def _build_dependencies():
 def _build_zlib():
     src = _DEPS / "zlib"
     build = _WORK / "build-zlib"
-    marker = _INSTALL / "lib" / "libz.so"
-    if marker.exists():
+    if _lib_exists("libz.so"):
         return
     _clone(ZLIB_REPO, ZLIB_REF, src)
     _run([
@@ -152,6 +173,7 @@ def _build_zlib():
         "-B", build,
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={_INSTALL}",
+        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DBUILD_SHARED_LIBS=ON",
     ], env=_env())
@@ -161,27 +183,23 @@ def _build_zlib():
 
 def _build_bzip2():
     src = _DEPS / "bzip2"
-    marker = _INSTALL / "lib" / "libbz2.so"
-    if marker.exists():
+    marker = _primary_lib_dir() / "libbz2.so"
+    if _lib_exists("libbz2.so"):
         return
     _clone(BZIP2_REPO, BZIP2_REF, src)
     _run(["make", "-f", "Makefile-libbz2_so", "-j", _jobs()], cwd=src, env=_env())
     (_INSTALL / "include").mkdir(parents=True, exist_ok=True)
-    (_INSTALL / "lib").mkdir(parents=True, exist_ok=True)
+    _primary_lib_dir().mkdir(parents=True, exist_ok=True)
     shutil.copy2(src / "bzlib.h", _INSTALL / "include" / "bzlib.h")
     for so in src.glob("libbz2.so*"):
-        shutil.copy2(so, _INSTALL / "lib" / so.name)
+        shutil.copy2(so, _primary_lib_dir() / so.name)
     if not marker.exists():
-        libs = sorted((_INSTALL / "lib").glob("libbz2.so.*"))
-        if not libs:
-            raise RuntimeError("libbz2.so not built")
-        shutil.copy2(libs[-1], marker)
+        _copy_first_lib("libbz2.so.*", marker, "libbz2.so not built")
 
 
 def _build_xz():
     src = _DEPS / "xz"
-    marker = _INSTALL / "lib" / "liblzma.so"
-    if marker.exists():
+    if _lib_exists("liblzma.so"):
         return
     if src.exists() and not (src / "configure").exists():
         shutil.rmtree(src)
@@ -202,8 +220,7 @@ def _build_xz():
 
 def _build_zstd():
     src = _DEPS / "zstd"
-    marker = _INSTALL / "lib" / "libzstd.so"
-    if marker.exists():
+    if _lib_exists("libzstd.so"):
         return
     _clone(ZSTD_REPO, ZSTD_REF, src)
     _run([
@@ -219,8 +236,8 @@ def _build_zstd():
 def _build_libbsc():
     src = _DEPS / "libbsc"
     build = _WORK / "build-libbsc"
-    marker = _INSTALL / "lib" / "libbsc.so"
-    if marker.exists():
+    marker = _primary_lib_dir() / "libbsc.so"
+    if _lib_exists("libbsc.so"):
         return
     _clone(LIBBSC_REPO, LIBBSC_REF, src)
     _run([
@@ -229,6 +246,7 @@ def _build_libbsc():
         "-B", build,
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={_INSTALL}",
+        "-DCMAKE_INSTALL_LIBDIR=lib",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DBUILD_SHARED_LIBS=ON",
         "-DBSC_BUILD_SHARED_LIB=ON",
@@ -243,16 +261,12 @@ def _build_libbsc():
     if header.resolve() != header_dst.resolve():
         shutil.copy2(header, header_dst)
     if not marker.exists():
-        libs = sorted((_INSTALL / "lib").glob("libbsc.so*"))
-        if not libs:
-            raise RuntimeError("libbsc.so not built")
-        shutil.copy2(libs[-1], marker)
+        _copy_first_lib("libbsc.so*", marker, "libbsc.so not built")
 
 
 def _build_htslib():
     src = _DEPS / "htslib"
-    marker = _INSTALL / "lib" / "libhts.so"
-    if marker.exists():
+    if _lib_exists("libhts.so"):
         return
     if src.exists() and not (src / "configure").exists():
         shutil.rmtree(src)
@@ -281,14 +295,15 @@ def _build_genie():
     build.mkdir(parents=True, exist_ok=True)
 
     install_include = _INSTALL / "include"
-    install_lib = _INSTALL / "lib"
+    install_lib = _primary_lib_dir()
+    lib_rpath = ";".join(str(path) for path in _lib_dirs())
     cmake_args = [
         "cmake",
         "-S", src,
         "-B", build,
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_PREFIX_PATH={_INSTALL}",
-        f"-DCMAKE_BUILD_RPATH=$ORIGIN;{install_lib}",
+        f"-DCMAKE_BUILD_RPATH=$ORIGIN;{lib_rpath}",
         f"-DCMAKE_INSTALL_RPATH=$ORIGIN",
         "-DGENIE_USE_OPENMP=OFF",
         "-DGENIE_SAM_SUPPORT=ON",
@@ -319,9 +334,10 @@ def _build_genie():
     _INTERNALS.mkdir(parents=True, exist_ok=True)
     shutil.copy2(libgenie, _INTERNALS / "libgenie.so")
     for pattern in ("libbsc.so*", "libzstd.so*", "liblzma.so*", "libhts.so*", "libz.so*", "libbz2.so*"):
-        for lib in (install_lib).glob(pattern):
-            if lib.is_file():
-                shutil.copy2(lib, _INTERNALS / _plain_so_name(lib))
+        for lib_dir in _lib_dirs():
+            for lib in lib_dir.glob(pattern):
+                if lib.is_file():
+                    shutil.copy2(lib, _INTERNALS / _plain_so_name(lib))
     print(f"mgb_native: installed libgenie.so and dependency libs -> {_INTERNALS}")
 
 
