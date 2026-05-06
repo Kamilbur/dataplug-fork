@@ -1,0 +1,7 @@
+# Native helper packages that live in this source tree.
+#
+# Python package metadata cannot portably reference relative subdirectories as
+# optional dependencies, and these packages are not published. Install this
+# file from the repository root when SRA/MGB native helpers are needed.
+./native_helpers/sra_native
+./native_helpers/mgb_native

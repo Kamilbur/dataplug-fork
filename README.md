@@ -45,6 +45,14 @@
     pip install git+https://github.com/CLOUDLAB-URV/dataplug
     ```
 
+- Native SRA/MGB helper packages live in this repository under `native_helpers/`. For a source checkout, install them from the repository root before installing Dataplug:
+
+    ```bash
+    python -m pip install --upgrade pip setuptools wheel
+    pip install -r requirements-native.txt
+    pip install .
+    ```
+
 
 ### Partitioning text example
 
@@ -98,5 +106,3 @@ The logo has been proudly generated using [cooltext.com](https://cooltext.com/).
 ## License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-

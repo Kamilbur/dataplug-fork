@@ -12,7 +12,7 @@ from setuptools.command.build_py import build_py as _build_py
 
 
 GENIE_REPO = "https://github.com/Kamilbur/genie.git"
-GENIE_REF = os.environ.get("GENIE_NATIVE_GENIE_REF", "")
+GENIE_REF = os.environ.get("MGB_NATIVE_GENIE_REF", os.environ.get("GENIE_NATIVE_GENIE_REF", ""))
 
 ZLIB_REPO = "https://github.com/madler/zlib.git"
 ZLIB_REF = "v1.3.1"
@@ -36,7 +36,7 @@ HTSLIB_ARCHIVE = (
 
 
 _HERE = Path(__file__).parent.resolve()
-_ROOT = _HERE.parent
+_ROOT = _HERE.parents[1]
 _WORK = _HERE / "_build"
 _DEPS = _WORK / "dependencies"
 _INSTALL = _WORK / "install"
@@ -56,7 +56,7 @@ def _jobs() -> str:
 
 
 def _run(args, cwd: Path | None = None, env: dict[str, str] | None = None):
-    print("genie_native:", " ".join(map(str, args)))
+    print("mgb_native:", " ".join(map(str, args)))
     subprocess.run([str(arg) for arg in args], cwd=cwd, env=env, check=True)
 
 
@@ -77,7 +77,7 @@ def _download_archive(url: str, dst: Path):
     if dst.exists():
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
-    print(f"genie_native: downloading {url}")
+    print(f"mgb_native: downloading {url}")
     urllib.request.urlretrieve(url, dst)
 
 
@@ -322,7 +322,7 @@ def _build_genie():
         for lib in (install_lib).glob(pattern):
             if lib.is_file():
                 shutil.copy2(lib, _INTERNALS / _plain_so_name(lib))
-    print(f"genie_native: installed libgenie.so and dependency libs -> {_INTERNALS}")
+    print(f"mgb_native: installed libgenie.so and dependency libs -> {_INTERNALS}")
 
 
 def _patch_genie_source(src: Path):
@@ -350,12 +350,12 @@ def _build_shims():
         "-Wextra",
         "-O2",
     ])
-    print(f"genie_native: built libmgbshims.so -> {_INTERNALS}")
+    print(f"mgb_native: built libmgbshims.so -> {_INTERNALS}")
 
 
 setup(
-    name="dataplug-genie-native",
+    name="dataplug-mgb-native",
     version="1.0.0",
-    packages=["genie_native"],
+    packages=["mgb_native"],
     cmdclass={"build_py": BuildPy},
 )

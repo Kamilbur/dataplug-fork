@@ -36,8 +36,8 @@ geospatial = [
     "laspy",
     "PDAL"
 ]
-sra = ["dataplug-sra-native @ file:./sra_native"]
-mgb = ["dataplug-genie-native @ file:./genie_native"]
+sra = []
+mgb = []
 dev = ["pytest", "moto[s3]"]
 
 

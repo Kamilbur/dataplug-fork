@@ -9,7 +9,8 @@ from setuptools.command.build_py import build_py as _build_py
 NCBI_VDB_REPO = "https://github.com/ncbi/ncbi-vdb"
 
 _HERE = Path(__file__).parent
-_INTERNALS = _HERE.parent / "dataplug" / "formats" / "genomics" / "sra" / "internals"
+_ROOT = _HERE.parents[1]
+_INTERNALS = _ROOT / "dataplug" / "formats" / "genomics" / "sra" / "internals"
 
 
 class BuildPy(_build_py):

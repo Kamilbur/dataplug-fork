@@ -1,26 +1,20 @@
 from __future__ import annotations
 
-import os
-import sys
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import suppress
-from pathlib import posixpath, PurePath
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 import boto3
 import botocore.client
 
 if TYPE_CHECKING:
-    from typing import Optional
-    from mypy_boto3_s3.type_defs import DeleteObjectOutputTypeDef, DeleteObjectsOutputTypeDef
 
-try:
-    from pathlib import _PosixFlavour
-except ImportError as _:
-    _PosixFlavour = object
+    from mypy_boto3_s3.type_defs import DeleteObjectOutputTypeDef, DeleteObjectsOutputTypeDef
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +49,13 @@ class PickleableS3ClientProxy:
     """
 
     def __init__(
-            self,
-            region_name: Optional[str] = None,
-            endpoint_url: Optional[str] = None,
-            credentials: Optional[dict] = None,
-            role_arn: Optional[str] = None,
-            token_duration_seconds: Optional[int] = None,
-            botocore_config_kwargs: Optional[dict] = None,
+        self,
+        region_name: str | None = None,
+        endpoint_url: str | None = None,
+        credentials: dict | None = None,
+        role_arn: str | None = None,
+        token_duration_seconds: int | None = None,
+        botocore_config_kwargs: dict | None = None,
     ):
         self.region_name = region_name
         self.endpoint_url = endpoint_url
@@ -80,18 +74,14 @@ class PickleableS3ClientProxy:
 
         if credentials:
             # check if credentials are valid
-            if not all(
-                    key in credentials for key in ["AccessKeyId", "SecretAccessKey"]
-            ):
+            if not all(key in credentials for key in ["AccessKeyId", "SecretAccessKey"]):
                 raise ValueError(
                     "Invalid credentials. AccessKeyId and SecretAccessKey are required if credentials are provided."
                 )
             self.credentials = credentials
 
         elif role_arn is not None:
-            self.session_name = "-".join(
-                ["dataplug", str(int(time.time())), uuid.uuid4().hex]
-            )
+            self.session_name = "-".join(["dataplug", str(int(time.time())), uuid.uuid4().hex])
             logger.debug(
                 "Assuming role %s with generated session name %s",
                 self.role_arn,
@@ -108,9 +98,7 @@ class PickleableS3ClientProxy:
 
         else:
             logger.debug("Getting session token")
-            response = sts_admin.get_session_token(
-                DurationSeconds=self.token_duration_seconds
-            )
+            response = sts_admin.get_session_token(DurationSeconds=self.token_duration_seconds)
             self.credentials = response["Credentials"]
 
         self.__client = boto3.client(
@@ -275,35 +263,48 @@ class PickleableS3ClientProxy:
         return response
 
 
-class _S3Flavour(_PosixFlavour):
-    is_supported = True
+class S3Path:
+    """
+    Small POSIX-like path value for AWS S3 object references.
 
-    def parse_parts(self, parts):
-        drv, root, parsed = super().parse_parts(parts)
-        for part in parsed[1:]:
+    pathlib internals changed across Python versions, so this class wraps the
+    public PurePosixPath API instead of subclassing PurePath or overriding
+    private path flavours.
+    """
+
+    __slots__ = ("_path",)
+
+    def __init__(self, *parts: object):
+        if not parts:
+            raw_path = "."
+        else:
+            raw_path = "/".join(str(part).strip("/") for part in parts if str(part))
+            if str(parts[0]).startswith("/"):
+                raw_path = "/" + raw_path
+        self._path = PurePosixPath(self._normalize(raw_path))
+
+    @staticmethod
+    def _normalize(path: str) -> str:
+        is_absolute = path.startswith("/")
+        normalized_parts: list[str] = []
+        for part in path.split("/"):
+            if part in ("", "."):
+                continue
             if part == "..":
-                index = parsed.index(part)
-                parsed.pop(index - 1)
-                parsed.remove(part)
-        return drv, root, parsed
+                if normalized_parts and normalized_parts[-1] != "..":
+                    normalized_parts.pop()
+                elif not is_absolute:
+                    normalized_parts.append(part)
+                continue
+            normalized_parts.append(part)
 
-    def make_uri(self, path):
-        uri = super().make_uri(path)
-        return uri.replace("file:///", "s3://")
-
-
-class S3Path(PurePath):
-    """
-    PurePath subclass for AWS S3 service.
-    Source: https://github.com/liormizr/s3path
-    S3 is not a file-system but we can look at it like a POSIX system.
-    """
-
-    parser = posixpath
-    __slots__ = ()
+        normalized = "/".join(normalized_parts)
+        if is_absolute:
+            return "/" + normalized if normalized else "/"
+        return normalized or "."
 
     @classmethod
-    def from_uri(cls, uri: str) -> "S3Path":
+    def from_uri(cls, uri: str) -> S3Path:
         """
         from_uri class method create a class instance from url
 
@@ -313,10 +314,10 @@ class S3Path(PurePath):
         """
         if not uri.startswith("s3://"):
             raise ValueError("Provided uri seems to be no S3 URI!")
-        return cls(uri[4:])
+        return cls("/", uri[5:])
 
     @classmethod
-    def from_bucket_key(cls, bucket: str, key: str) -> "S3Path":
+    def from_bucket_key(cls, bucket: str, key: str) -> S3Path:
         """
         from_bucket_key class method create a class instance from bucket, key pair's
 
@@ -324,10 +325,10 @@ class S3Path(PurePath):
         >> PureS3Path.from_bucket_key(bucket='<bucket>', key='<key>')
         << PureS3Path('/<bucket>/<key>')
         """
-        bucket = cls(cls.parser.sep, bucket)
+        bucket = cls("/", bucket)
         if len(bucket.parts) != 2:
             raise ValueError(
-                "bucket argument contains more then one path element: {}".format(bucket)
+                f"bucket argument contains more then one path element: {bucket}"
             )
         key = cls(key)
         if key.is_absolute():
@@ -351,8 +352,7 @@ class S3Path(PurePath):
         The AWS S3 Key name, or ''
         """
         self._absolute_path_validation()
-        key = self.parser.sep.join(self.parts[2:])
-        return key
+        return "/".join(self.parts[2:])
 
     @property
     def virtual_directory(self) -> str:
@@ -370,16 +370,86 @@ class S3Path(PurePath):
         self._absolute_path_validation()
         return f"s3://{self.bucket}/{self.key}"
 
+    @property
+    def parts(self) -> tuple[str, ...]:
+        return self._path.parts
+
+    @property
+    def name(self) -> str:
+        return self._path.name
+
+    @property
+    def suffix(self) -> str:
+        return self._path.suffix
+
+    @property
+    def suffixes(self) -> list[str]:
+        return self._path.suffixes
+
+    @property
+    def stem(self) -> str:
+        return self._path.stem
+
+    @property
+    def parent(self) -> S3Path:
+        return self.__class__(self._path.parent)
+
+    @property
+    def parents(self) -> tuple[S3Path, ...]:
+        return tuple(self.__class__(parent) for parent in self._path.parents)
+
+    def is_absolute(self) -> bool:
+        return self._path.is_absolute()
+
+    def relative_to(self, other: str | S3Path) -> S3Path:
+        other_path = other._path if isinstance(other, S3Path) else PurePosixPath(str(other))
+        return self.__class__(self._path.relative_to(other_path))
+
+    def is_relative_to(self, other: str | S3Path) -> bool:
+        other_path = other._path if isinstance(other, S3Path) else PurePosixPath(str(other))
+        return self._path.is_relative_to(other_path)
+
+    def as_posix(self) -> str:
+        return self._path.as_posix()
+
+    def joinpath(self, *other: object) -> S3Path:
+        return self.__class__(self._path, *other)
+
+    def match(self, path_pattern: str) -> bool:
+        return self._path.match(path_pattern)
+
+    def with_name(self, name: str) -> S3Path:
+        return self.__class__(self._path.with_name(name))
+
+    def with_stem(self, stem: str) -> S3Path:
+        return self.__class__(self._path.with_stem(stem))
+
+    def with_suffix(self, suffix: str) -> S3Path:
+        return self.__class__(self._path.with_suffix(suffix))
+
+    def __truediv__(self, other: object) -> S3Path:
+        return self.joinpath(other)
+
+    def __str__(self) -> str:
+        return self.as_posix()
+
+    def __fspath__(self) -> str:
+        return self.as_posix()
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, S3Path):
+            return NotImplemented
+        return self._path == other._path
+
+    def __hash__(self) -> int:
+        return hash(self._path)
+
     def _absolute_path_validation(self):
         if not self.is_absolute():
             raise ValueError("relative path have no bucket, key specification")
 
     def __repr__(self) -> str:
-        return "{}(bucket={},key={})".format(
-            self.__class__.__name__, self.bucket, self.key
-        )
+        return f"{self.__class__.__name__}(bucket={self.bucket},key={self.key})"
 
-if sys.version_info < (3, 12):
-    S3Path._flavour = _S3Flavour()
-else:
-    os.environ['AWS_REQUEST_CHECKSUM_CALCULATION'] = 'WHEN_REQUIRED'
+
+os.environ.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "WHEN_REQUIRED")
