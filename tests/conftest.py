@@ -9,7 +9,7 @@ import pytest
 from moto import mock_aws
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-SRA_FIXTURES_DIR = FIXTURES_DIR / "fixtures"
+SRA_FIXTURES_DIR = FIXTURES_DIR / "sra"
 HASHES_DIR = FIXTURES_DIR / "hashes"
 FIXTURE_MANIFEST = Path(__file__).parent / "prepare_tests" / "test-files.json"
 

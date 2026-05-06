@@ -16,7 +16,7 @@ def main():
     meta_bucket = bucket + ".meta"
     accession = "SRR19392985"
     uri = f"s3://{bucket}/{accession}"
-    fixture = Path(__file__).parent / "fixtures" / "fixtures" / accession
+    fixture = Path(__file__).parent / "fixtures" / "sra" / accession
 
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
