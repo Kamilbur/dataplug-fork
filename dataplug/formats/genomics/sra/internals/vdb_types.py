@@ -8,8 +8,10 @@ from .vdb import vdb
 
 def to_char_p(s):
     if isinstance(s, str):
-        return C.c_char_p(s.encode())
-    return C.c_char_p(s)
+        return s.encode()
+    if isinstance(s, C.c_char_p):
+        return s.value
+    return s
 
 
 class Typedecl(C.Structure):
@@ -75,7 +77,7 @@ class VColumn:
             self.name = name
 
     def update(self):
-        vdb.VCursorDatatype(self.cur, self.idx, byref(self.tdec), byref(self.tdes))
+        vdb.VCursorDatatype(self.cur, self.idx, byref(self.tdec, vdb), byref(self.tdes, vdb))
         (dict, dflt) = type_xf[self.tdes.domain]
         self.column_type = dict[self.tdes.bits]
         if self.column_type is None:
@@ -90,17 +92,17 @@ class VColumn:
             self.cur,
             row_id,
             self.idx,
-            byref(elem_bits),
-            byref(data),
+            byref(elem_bits, vdb),
+            byref(data, vdb),
             None,
-            byref(row_len),
+            byref(row_len, vdb),
         )
         if self.column_type == C.c_char:
             tmp = C.string_at(data, row_len.value)
             if isinstance(tmp, bytes):
                 return tmp.decode("utf-8")
             return tmp
-        typed_ptr = cast(data, C.POINTER(self.column_type))
+        typed_ptr = cast(data, C.POINTER(self.column_type), vdb)
         e_count = row_len.value
         if elem_bits.value < 8:
             e_count *= elem_bits.value
@@ -110,5 +112,5 @@ class VColumn:
     def row_range(self):
         first = C.c_longlong()
         count = C.c_longlong()
-        vdb.VCursorIdRange(self.cur, self.idx, byref(first), byref(count))
+        vdb.VCursorIdRange(self.cur, self.idx, byref(first, vdb), byref(count, vdb))
         return (first.value, count.value)

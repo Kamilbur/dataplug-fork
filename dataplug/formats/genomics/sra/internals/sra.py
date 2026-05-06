@@ -18,19 +18,25 @@ _COLUMN_NAMES = (
 
 
 def _release(name, handle):
-    if handle is not None and handle.value:
+    if handle is not None and _handle_value(handle):
         with contextlib.suppress(Exception):
-            getattr(vdb, name)(handle)
+            getattr(vdb, name)(_handle_value(handle))
+
+
+def _handle_value(handle):
+    if isinstance(handle, C.c_void_p):
+        return handle.value or 0
+    return handle or 0
 
 
 def _open_table(mgr, path):
     tab = C.c_void_p()
-    if vdb.VDBManagerOpenTableRead(mgr, byref(tab), C.c_void_p(0), to_char_p(path)) == 0:
+    if vdb.VDBManagerOpenTableRead(_handle_value(mgr), byref(tab, vdb), 0, to_char_p(path)) == 0:
         return tab, None
     db = C.c_void_p()
-    if vdb.VDBManagerOpenDBRead(mgr, byref(db), C.c_void_p(0), to_char_p(path)) != 0:
+    if vdb.VDBManagerOpenDBRead(_handle_value(mgr), byref(db, vdb), 0, to_char_p(path)) != 0:
         raise ValueError("Not an SRA-object: " + path)
-    if vdb.VDatabaseOpenTableRead(db, byref(tab), to_char_p("SEQUENCE")) == 0:
+    if vdb.VDatabaseOpenTableRead(_handle_value(db), byref(tab, vdb), to_char_p("SEQUENCE")) == 0:
         return tab, db
     _release("VDatabaseRelease", db)
     raise ValueError("Not an SRA-object: " + path)
@@ -40,10 +46,10 @@ def _open_cursor(path):
     nat_dir = C.c_void_p()
     mgr = C.c_void_p()
     cur = C.c_void_p()
-    vdb.KDirectoryNativeDir_v1(byref(nat_dir))
-    vdb.VDBManagerMakeRead(byref(mgr), nat_dir)
+    vdb.KDirectoryNativeDir_v1(byref(nat_dir, vdb))
+    vdb.VDBManagerMakeRead(byref(mgr, vdb), _handle_value(nat_dir))
     tab, db = _open_table(mgr, path)
-    vdb.VTableCreateCursorRead(tab, byref(cur))
+    vdb.VTableCreateCursorRead(_handle_value(tab), byref(cur, vdb))
     return cur, tab, db, mgr, nat_dir
 
 
@@ -61,9 +67,9 @@ class VColumns:
         self.columns = []
         for name in _COLUMN_NAMES:
             idx = C.c_int()
-            vdb.VCursorAddColumn(cur, byref(idx), to_char_p(name))
-            self.columns.append(VColumn(idx.value, cur))
-        vdb.VCursorOpen(cur)
+            vdb.VCursorAddColumn(_handle_value(cur), byref(idx, vdb), to_char_p(name))
+            self.columns.append(VColumn(idx.value, _handle_value(cur)))
+        vdb.VCursorOpen(_handle_value(cur))
         for col in self.columns:
             col.update()
 
