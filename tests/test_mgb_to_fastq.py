@@ -28,14 +28,6 @@ MGB_BUCKET = os.getenv("MGB_S3_BUCKET", "test-mgb")
 MGB_META_BUCKET = MGB_BUCKET + ".meta"
 MGB_FIXTURES_DIR = Path(os.getenv("MGB_FIXTURES_DIR", FIXTURES_DIR / "mgb"))
 FASTQ_FIXTURES_DIR = Path(os.getenv("FASTQ_FIXTURES_DIR", FIXTURES_DIR / "fastq"))
-GENIE_CLONE_FIXTURES_DIR = (
-    Path(__file__).resolve().parents[1]
-    / ".clones"
-    / "genie"
-    / "data"
-    / "mpeg-g"
-    / "conformance"
-)
 CHUNK_COUNTS = [1, 2, 3, 5]
 
 
@@ -47,18 +39,12 @@ def _genie_library_exists() -> bool:
     repo_root = Path(__file__).resolve().parents[1]
     candidates = [
         repo_root / "dataplug" / "formats" / "genomics" / "mgb" / "internals" / "libgenie.so",
-        repo_root / ".clones" / "genie" / "build" / "lib" / "libgenie.so",
     ]
     return any(path.exists() for path in candidates)
 
 
 def mgb_files_with_fixtures() -> list[Path]:
-    paths = []
-    if MGB_FIXTURES_DIR.exists():
-        paths.extend(sorted(MGB_FIXTURES_DIR.glob("*.mgb")))
-    if not paths and GENIE_CLONE_FIXTURES_DIR.exists():
-        paths.extend(sorted(GENIE_CLONE_FIXTURES_DIR.glob("*/*.mgb")))
-    return paths
+    return sorted(MGB_FIXTURES_DIR.glob("*.mgb"))
 
 
 def mgb_fastq_fixture_pairs() -> list[tuple[Path, Path]]:

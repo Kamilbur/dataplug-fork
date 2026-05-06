@@ -43,10 +43,14 @@ def load_reference_hashes(acc: str) -> dict:
 
 
 def sra_accessions_with_fixtures() -> list[str]:
-    """Return accessions that have a local SRA binary in fixtures/fixtures/."""
+    """Return accessions that have a local SRA binary in fixtures/sra/."""
     if not SRA_FIXTURES_DIR.exists():
         return []
-    return sorted(p.name for p in SRA_FIXTURES_DIR.iterdir() if p.is_file())
+    return sorted(
+        p.name
+        for p in SRA_FIXTURES_DIR.iterdir()
+        if p.is_file() and not p.name.startswith(".")
+    )
 
 
 def _load_manifest() -> list[dict]:

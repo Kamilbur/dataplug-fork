@@ -21,10 +21,6 @@ def _default_genie_path() -> Path:
     if local.exists():
         return local
 
-    clone_build = _REPO_ROOT / ".clones" / "genie" / "build" / "lib" / "libgenie.so"
-    if clone_build.exists():
-        return clone_build
-
     return local
 
 
