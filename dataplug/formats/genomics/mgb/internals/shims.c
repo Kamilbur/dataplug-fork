@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 
 #define MAX_SPECIAL_FDS 128
+#define MAX_SPECIAL_FPS 128
 #define MAX_RANGES 65536
 
 struct file_info {
@@ -27,6 +29,11 @@ struct file_info {
 
 struct fd_info {
     int fd;
+    off_t offset;
+};
+
+struct fp_info {
+    FILE *fp;
     off_t offset;
 };
 
@@ -48,9 +55,24 @@ int enable_mmap = 0;
 int enable_mmap64 = 0;
 int enable_lseek = 0;
 int enable_lseek64 = 0;
+int enable_fopen = 0;
+int enable_fopen64 = 0;
+int enable_freopen = 0;
+int enable_fread = 0;
+int enable_fread_unlocked = 0;
+int enable_fclose = 0;
+int enable_fseek = 0;
+int enable_fseeko = 0;
+int enable_fseeko64 = 0;
+int enable_ftell = 0;
+int enable_ftello = 0;
+int enable_ftello64 = 0;
+int enable_fileno = 0;
 
 static struct fd_info special_fds[MAX_SPECIAL_FDS];
 static size_t special_fd_count = 0;
+static struct fp_info special_fps[MAX_SPECIAL_FPS];
+static size_t special_fp_count = 0;
 static __thread int in_hook = 0;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
@@ -68,6 +90,19 @@ static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
 static void *(*real_mmap64)(void *, size_t, int, int, int, off64_t) = NULL;
 static off_t (*real_lseek)(int, off_t, int) = NULL;
 static off64_t (*real_lseek64)(int, off64_t, int) = NULL;
+static FILE *(*real_fopen)(const char *, const char *) = NULL;
+static FILE *(*real_fopen64)(const char *, const char *) = NULL;
+static FILE *(*real_freopen)(const char *, const char *, FILE *) = NULL;
+static size_t (*real_fread)(void *, size_t, size_t, FILE *) = NULL;
+static size_t (*real_fread_unlocked)(void *, size_t, size_t, FILE *) = NULL;
+static int (*real_fclose)(FILE *) = NULL;
+static int (*real_fseek)(FILE *, long, int) = NULL;
+static int (*real_fseeko)(FILE *, off_t, int) = NULL;
+static int (*real_fseeko64)(FILE *, off64_t, int) = NULL;
+static long (*real_ftell)(FILE *) = NULL;
+static off_t (*real_ftello)(FILE *) = NULL;
+static off64_t (*real_ftello64)(FILE *) = NULL;
+static int (*real_fileno)(FILE *) = NULL;
 
 static void init_real(void) {
     real_open = dlsym(RTLD_NEXT, "open");
@@ -84,6 +119,19 @@ static void init_real(void) {
     real_mmap64 = dlsym(RTLD_NEXT, "mmap64");
     real_lseek = dlsym(RTLD_NEXT, "lseek");
     real_lseek64 = dlsym(RTLD_NEXT, "lseek64");
+    real_fopen = dlsym(RTLD_NEXT, "fopen");
+    real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
+    real_freopen = dlsym(RTLD_NEXT, "freopen");
+    real_fread = dlsym(RTLD_NEXT, "fread");
+    real_fread_unlocked = dlsym(RTLD_NEXT, "fread_unlocked");
+    real_fclose = dlsym(RTLD_NEXT, "fclose");
+    real_fseek = dlsym(RTLD_NEXT, "fseek");
+    real_fseeko = dlsym(RTLD_NEXT, "fseeko");
+    real_fseeko64 = dlsym(RTLD_NEXT, "fseeko64");
+    real_ftell = dlsym(RTLD_NEXT, "ftell");
+    real_ftello = dlsym(RTLD_NEXT, "ftello");
+    real_ftello64 = dlsym(RTLD_NEXT, "ftello64");
+    real_fileno = dlsym(RTLD_NEXT, "fileno");
 }
 
 static int open_needs_mode(int flags) {
@@ -113,6 +161,22 @@ static void remove_fd(int fd) {
     for (size_t i = 0; i < special_fd_count; ++i) {
         if (special_fds[i].fd == fd) {
             special_fds[i] = special_fds[--special_fd_count];
+            return;
+        }
+    }
+}
+
+static struct fp_info *find_fp(FILE *fp) {
+    for (size_t i = 0; i < special_fp_count; ++i) {
+        if (special_fps[i].fp == fp) return &special_fps[i];
+    }
+    return NULL;
+}
+
+static void remove_fp(FILE *fp) {
+    for (size_t i = 0; i < special_fp_count; ++i) {
+        if (special_fps[i].fp == fp) {
+            special_fps[i] = special_fps[--special_fp_count];
             return;
         }
     }
@@ -439,4 +503,184 @@ off64_t lseek64(int fd, off64_t offset, int whence) {
         return next;
     }
     return seek_impl(fdinfo, offset, whence);
+}
+
+static FILE *fopen_hook(const char *pathname, const char *mode, int use64) {
+    if (info.filename == NULL) return NULL;
+    if (strcmp(base_name(pathname), info.filename) != 0) return NULL;
+    if (special_fp_count >= MAX_SPECIAL_FPS) return NULL;
+    FILE *fp = use64 ? real_fopen64(pathname, mode) : real_fopen(pathname, mode);
+    if (fp != NULL) {
+        special_fps[special_fp_count++] = (struct fp_info){fp, 0};
+    }
+    return fp;
+}
+
+FILE *fopen(const char *pathname, const char *mode) {
+    pthread_once(&init_once, init_real);
+    if (!enable_fopen || in_hook) return real_fopen(pathname, mode);
+    in_hook = 1;
+    FILE *fp = fopen_hook(pathname, mode, 0);
+    if (fp == NULL) fp = real_fopen(pathname, mode);
+    in_hook = 0;
+    return fp;
+}
+
+FILE *fopen64(const char *pathname, const char *mode) {
+    pthread_once(&init_once, init_real);
+    if (!enable_fopen64 || in_hook) return real_fopen64(pathname, mode);
+    in_hook = 1;
+    FILE *fp = fopen_hook(pathname, mode, 1);
+    if (fp == NULL) fp = real_fopen64(pathname, mode);
+    in_hook = 0;
+    return fp;
+}
+
+FILE *freopen(const char *pathname, const char *mode, FILE *stream) {
+    pthread_once(&init_once, init_real);
+    if (!enable_freopen || in_hook) return real_freopen(pathname, mode, stream);
+    in_hook = 1;
+    remove_fp(stream);
+    FILE *fp = real_freopen(pathname, mode, stream);
+    if (fp != NULL && info.filename != NULL && pathname != NULL &&
+        strcmp(base_name(pathname), info.filename) == 0 &&
+        special_fp_count < MAX_SPECIAL_FPS) {
+        special_fps[special_fp_count++] = (struct fp_info){fp, 0};
+    }
+    in_hook = 0;
+    return fp;
+}
+
+static size_t fread_record(void *ptr, size_t size, size_t nmemb, FILE *stream,
+                           size_t (*fn)(void *, size_t, size_t, FILE *)) {
+    struct fp_info *fpi = find_fp(stream);
+    if (fpi == NULL) return fn(ptr, size, nmemb, stream);
+    if (dp_mode == 0) {
+        size_t result = fn(ptr, size, nmemb, stream);
+        size_t bytes = result * size;
+        if (bytes > 0) {
+            record_range((uint64_t)fpi->offset, (uint64_t)bytes);
+            fpi->offset += (off_t)bytes;
+        }
+        return result;
+    }
+    return fn(ptr, size, nmemb, stream);
+}
+
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    pthread_once(&init_once, init_real);
+    if (!enable_fread || in_hook) return real_fread(ptr, size, nmemb, stream);
+    in_hook = 1;
+    size_t result = fread_record(ptr, size, nmemb, stream, real_fread);
+    in_hook = 0;
+    return result;
+}
+
+size_t fread_unlocked(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    pthread_once(&init_once, init_real);
+    if (!enable_fread_unlocked || in_hook || real_fread_unlocked == NULL) {
+        return real_fread_unlocked ? real_fread_unlocked(ptr, size, nmemb, stream)
+                                   : real_fread(ptr, size, nmemb, stream);
+    }
+    in_hook = 1;
+    size_t result = fread_record(ptr, size, nmemb, stream, real_fread_unlocked);
+    in_hook = 0;
+    return result;
+}
+
+int fclose(FILE *stream) {
+    pthread_once(&init_once, init_real);
+    if (enable_fclose && !in_hook) remove_fp(stream);
+    return real_fclose(stream);
+}
+
+static off64_t fseek_impl(struct fp_info *fpi, off64_t offset, int whence) {
+    off64_t base;
+    if (whence == SEEK_SET) base = 0;
+    else if (whence == SEEK_CUR) base = fpi->offset;
+    else if (whence == SEEK_END) base = (off64_t)info.size;
+    else return -1;
+    off64_t next = base + offset;
+    if (next < 0) return -1;
+    fpi->offset = (off_t)next;
+    return next;
+}
+
+int fseek(FILE *stream, long offset, int whence) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_fseek || in_hook || fpi == NULL) {
+        return real_fseek(stream, offset, whence);
+    }
+    in_hook = 1;
+    int ret = real_fseek(stream, offset, whence);
+    if (ret == 0) fseek_impl(fpi, (off64_t)offset, whence);
+    in_hook = 0;
+    return ret;
+}
+
+int fseeko(FILE *stream, off_t offset, int whence) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_fseeko || in_hook || fpi == NULL) {
+        return real_fseeko(stream, offset, whence);
+    }
+    in_hook = 1;
+    int ret = real_fseeko(stream, offset, whence);
+    if (ret == 0) fseek_impl(fpi, (off64_t)offset, whence);
+    in_hook = 0;
+    return ret;
+}
+
+int fseeko64(FILE *stream, off64_t offset, int whence) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_fseeko64 || in_hook || fpi == NULL || real_fseeko64 == NULL) {
+        return real_fseeko64 ? real_fseeko64(stream, offset, whence)
+                             : real_fseeko(stream, (off_t)offset, whence);
+    }
+    in_hook = 1;
+    int ret = real_fseeko64(stream, offset, whence);
+    if (ret == 0) fseek_impl(fpi, offset, whence);
+    in_hook = 0;
+    return ret;
+}
+
+long ftell(FILE *stream) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_ftell || in_hook || fpi == NULL) {
+        return real_ftell(stream);
+    }
+    return (long)fpi->offset;
+}
+
+off_t ftello(FILE *stream) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_ftello || in_hook || fpi == NULL || real_ftello == NULL) {
+        return real_ftello ? real_ftello(stream) : (off_t)real_ftell(stream);
+    }
+    return fpi->offset;
+}
+
+off64_t ftello64(FILE *stream) {
+    pthread_once(&init_once, init_real);
+    struct fp_info *fpi = find_fp(stream);
+    if (!enable_ftello64 || in_hook || fpi == NULL || real_ftello64 == NULL) {
+        return real_ftello64 ? real_ftello64(stream) : (off64_t)real_ftell(stream);
+    }
+    return (off64_t)fpi->offset;
+}
+
+int fileno(FILE *stream) {
+    pthread_once(&init_once, init_real);
+    int fd = real_fileno(stream);
+    if (!enable_fileno || in_hook) return fd;
+    struct fp_info *fpi = find_fp(stream);
+    if (fpi != NULL && fd >= 0 && find_fd(fd) == NULL &&
+        special_fd_count < MAX_SPECIAL_FDS) {
+        special_fds[special_fd_count++] = (struct fd_info){fd, fpi->offset};
+    }
+    return fd;
 }
