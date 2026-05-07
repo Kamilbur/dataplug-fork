@@ -222,6 +222,11 @@ static ssize_t read_mode1(struct fd_info *fdinfo, void *buf, size_t count) {
         if (start <= offset && offset < end) {
             size_t avail = (size_t)(end - offset);
             size_t to_read = count < avail ? count : avail;
+            if (info.data == NULL) {
+                ssize_t nread = real_read(fdinfo->fd, buf, to_read);
+                if (nread > 0) fdinfo->offset += (off_t)nread;
+                return nread;
+            }
             memcpy(buf, info.data + buf_off + (offset - start), to_read);
             fdinfo->offset += (off_t)to_read;
             return (ssize_t)to_read;
@@ -240,6 +245,15 @@ ssize_t read(int fd, void *buf, size_t count) {
         if ((size_t)fdinfo->offset >= info.size) return 0;
         size_t remaining = info.size - (size_t)fdinfo->offset;
         size_t to_read = count < remaining ? count : remaining;
+        if (info.data == NULL) {
+            uint64_t offset = (uint64_t)fdinfo->offset;
+            ssize_t nread = real_read(fd, buf, to_read);
+            if (nread > 0) {
+                record_range(offset, (uint64_t)nread);
+                fdinfo->offset += (off_t)nread;
+            }
+            return nread;
+        }
         memcpy(buf, info.data + fdinfo->offset, to_read);
         record_range((uint64_t)fdinfo->offset, (uint64_t)to_read);
         fdinfo->offset += (off_t)to_read;
@@ -266,6 +280,11 @@ off_t lseek(int fd, off_t offset, int whence) {
     if (!enable_lseek || in_hook || fdinfo == NULL) {
         return real_lseek(fd, offset, whence);
     }
+    if (info.data == NULL) {
+        off_t next = real_lseek(fd, offset, whence);
+        if (next >= 0) fdinfo->offset = next;
+        return next;
+    }
     return (off_t)seek_impl(fdinfo, offset, whence);
 }
 
@@ -274,6 +293,11 @@ off64_t lseek64(int fd, off64_t offset, int whence) {
     struct fd_info *fdinfo = find_fd(fd);
     if (!enable_lseek64 || in_hook || fdinfo == NULL) {
         return real_lseek64(fd, offset, whence);
+    }
+    if (info.data == NULL) {
+        off64_t next = real_lseek64(fd, offset, whence);
+        if (next >= 0) fdinfo->offset = (off_t)next;
+        return next;
     }
     return seek_impl(fdinfo, offset, whence);
 }
