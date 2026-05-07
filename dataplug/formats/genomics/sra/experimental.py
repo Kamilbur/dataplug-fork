@@ -3,9 +3,12 @@ from __future__ import annotations
 import ctypes as C
 import io
 import logging
+import mmap
+import os
 import sysconfig
 import tempfile
-from contextlib import contextmanager
+from bisect import bisect_left
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,7 +18,7 @@ from cdlml import get_var
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
 
-from .internals.download import download_range, parallel_download_to_buffer, stream_to_bytes
+from .internals.download import CHUNK_SIZE, parallel_download_to_buffer, stream_to_bytes
 from .internals.interval import Interval, merge_intervals, partition_dry
 
 if TYPE_CHECKING:
@@ -30,8 +33,22 @@ c_off_t = _types_map[sysconfig.get_config_var("SIZEOF_OFF_T")]
 
 MAX_RANGES = 1024
 _RangesArray = C.c_uint64 * (1 + MAX_RANGES * 3)
+PREAD_BOOTSTRAP_GROUPS = 1
 
 _SYSCALLS = ["open", "close", "fstat", "read", "pread", "mmap", "munmap", "lseek"]
+
+
+class RangeBuffer:
+    def __init__(self, buffer, tmp):
+        self.buffer = buffer
+        self._tmp = tmp
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def close(self):
+        self.buffer.close()
+        self._tmp.close()
 
 
 def _vdb():
@@ -58,6 +75,9 @@ class FileInfo(C.Structure):
 
 
 def to_bytes(value, size: int | None = None) -> bytes:
+    if isinstance(value, RangeBuffer):
+        data = value.buffer[:]
+        return data if size is None else data[:size]
     if isinstance(value, bytes):
         return value if size is None else value[:size]
     if isinstance(value, str):
@@ -108,7 +128,12 @@ class ShimsMapping:
             return
 
         self._keepalive = (accession, data)
-        if isinstance(data, (bytes, bytearray, memoryview)):
+        if isinstance(data, RangeBuffer):
+            ptr = (C.c_char * len(data)).from_buffer(data.buffer)
+            self._keepalive = (accession, data, ptr)
+            addr = C.addressof(ptr)
+            buf = data
+        elif isinstance(data, (bytes, bytearray, memoryview)):
             buf = data if isinstance(data, bytearray) else bytearray(data)
             ptr = (C.c_char * len(buf)).from_buffer(buf)
             self._keepalive = (accession, buf, ptr)
@@ -210,23 +235,56 @@ def _download_to_bytes(cloud_object: CloudObject) -> bytes:
 
 
 def _build_range_buffer(cloud_object, mmaps, preads):
-    chunks = []
     buf_offset = 0
     mmap_entries = []
     pread_entries = []
     mmaps = merge_intervals(mmaps) if mmaps else []
     preads = merge_intervals(preads) if preads else []
+    tmp = tempfile.TemporaryFile()
+
+    def append_range(left: int, right: int, entries: list):
+        nonlocal buf_offset
+        expected = right - left
+        entries.append((buf_offset, left, right))
+        start_offset = buf_offset
+        resp = cloud_object.storage.get_object(
+            Bucket=cloud_object.path.bucket,
+            Key=cloud_object.path.key,
+            Range=f"bytes={left}-{right - 1}",
+        )
+        body = resp["Body"]
+        written = 0
+        try:
+            while True:
+                chunk = body.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                written += len(chunk)
+                buf_offset += len(chunk)
+        finally:
+            if hasattr(body, "close"):
+                body.close()
+        if written != expected:
+            raise IOError(f"short SRA range download: {left}-{right} got {written}, expected {expected}")
+        _drop_file_cache(tmp.fileno(), start_offset, written)
+
     for left, right in mmaps:
-        data = download_range(cloud_object, left, right - 1)
-        mmap_entries.append((buf_offset, left, right))
-        buf_offset += len(data)
-        chunks.append(data)
+        append_range(left, right, mmap_entries)
     for left, right in preads:
-        data = download_range(cloud_object, left, right - 1)
-        pread_entries.append((buf_offset, left, right))
-        buf_offset += len(data)
-        chunks.append(data)
-    return b"".join(chunks), mmap_entries, pread_entries
+        append_range(left, right, pread_entries)
+    tmp.flush()
+    if buf_offset == 0:
+        tmp.close()
+        return b"", mmap_entries, pread_entries
+    raw = mmap.mmap(tmp.fileno(), buf_offset, access=mmap.ACCESS_COPY)
+    return RangeBuffer(raw, tmp), mmap_entries, pread_entries
+
+
+def _drop_file_cache(fd: int, offset: int, length: int) -> None:
+    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+        with suppress(OSError):
+            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
 
 
 def _walk_record_ranges_python(vcols, total_lines: int, step: int, total_size: int,
@@ -462,7 +520,7 @@ class SRASlice(CloudObjectSlice):
 
         try:
             with mask.enabled_all(), temporary_sra(acc) as fpath:
-                shims_mapping.set_info(acc, raw, self.cloud_object.size, 0)
+                shims_mapping.set_info_zerocopy(acc, raw, self.cloud_object.size, 0)
                 with VColumns.from_filepath(fpath) as vcols:
                     for row_idx in range(self.start + 1, self.end + 1):
                         row = [col.read(row_idx) for col in vcols.columns]
@@ -470,6 +528,8 @@ class SRASlice(CloudObjectSlice):
         finally:
             sv["dp_mode"].value = 0
             shims_mapping.clear()
+            if isinstance(raw, RangeBuffer):
+                raw.close()
 
     def get(self, split=False) -> SRALines:
         return list(self.partial_download(split=split))
@@ -507,7 +567,7 @@ class SRASlice(CloudObjectSlice):
 
         try:
             with mask.enabled_all(), temporary_sra(acc) as fpath:
-                shims_mapping.set_info(acc, raw, self.cloud_object.size, 0)
+                shims_mapping.set_info_zerocopy(acc, raw, self.cloud_object.size, 0)
                 with VColumns.from_filepath(fpath) as vcols:
                     lib = _vdb()["shims"]
                     set_cell = lib.dp_set_vcursor_cell_func
@@ -546,6 +606,8 @@ class SRASlice(CloudObjectSlice):
         finally:
             sv["dp_mode"].value = 0
             shims_mapping.clear()
+            if isinstance(raw, RangeBuffer):
+                raw.close()
         return int(items.value), int(output_bytes.value)
 
     @staticmethod
@@ -554,23 +616,23 @@ class SRASlice(CloudObjectSlice):
 
 
 def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[SRASlice]:
-    mmaps = mapping.mmaps
+    mmaps = merge_intervals(mapping.mmaps) if mapping.mmaps else []
     preads = {int(key): list(value) for key, value in mapping.preads.items()}
     global_preads = preads.pop(-1, [])
+    keys = sorted(preads.keys())
+    bootstrap_keys = keys[:PREAD_BOOTSTRAP_GROUPS]
     slices = []
-    accumulator = global_preads.copy()
-
-    group_ends = iter(sorted(preads.keys()))
-    group_end = next(group_ends, None)
 
     for range_start, range_end in ranges:
-        while group_end is not None and group_end < range_end:
-            accumulator.extend(preads[group_end])
-            group_end = next(group_ends, None)
-
-        if group_end is not None:
-            accumulator.extend(preads[group_end])
-            group_end = next(group_ends, None)
+        accumulator = global_preads.copy()
+        for key in bootstrap_keys:
+            accumulator.extend(preads[key])
+        left = max(0, bisect_left(keys, range_start) - 1)
+        right = bisect_left(keys, range_end)
+        if right < len(keys):
+            right += 1
+        for key in keys[left:right]:
+            accumulator.extend(preads[key])
 
         slices.append(
             SRASlice(
