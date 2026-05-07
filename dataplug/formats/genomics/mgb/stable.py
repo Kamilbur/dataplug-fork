@@ -43,6 +43,19 @@ _SYSCALLS = [
     "mmap64",
     "lseek",
     "lseek64",
+    "fopen",
+    "fopen64",
+    "freopen",
+    "fread",
+    "fread_unlocked",
+    "fclose",
+    "fseek",
+    "fseeko",
+    "fseeko64",
+    "ftell",
+    "ftello",
+    "ftello64",
+    "fileno",
 ]
 
 
@@ -415,14 +428,24 @@ def preprocess_mgb(
     logger.info("Preprocessing mgb started")
 
     file_name = filename(cloud_object)
-    with temporary_mgb_from_cloud_object(file_name, cloud_object) as (fpath, _workdir):
+    with temporary_mgb_from_cloud_object(file_name, cloud_object) as (fpath, workdir):
         num_access_units = access_unit_count(fpath)
         logger.info("MGB has %d access units to map", num_access_units)
-        raw_reads, read_counts = access_unit_info(fpath)
-        reads = {
-            access_unit_id: merge_intervals(intervals)
-            for access_unit_id, intervals in raw_reads.items()
-        }
+        _, read_counts = access_unit_info(fpath)
+
+        size = Path(fpath).stat().st_size
+        workers = _mgb_map_worker_count(map_workers, num_access_units)
+        start_method = map_start_method or _mgb_default_start_method()
+        reads = _map_mgb_access_units(
+            fpath,
+            file_name,
+            size,
+            num_access_units,
+            threads,
+            workdir,
+            workers,
+            start_method,
+        )
 
     missing = [idx for idx in range(num_access_units) if not reads.get(idx)]
     if missing:
