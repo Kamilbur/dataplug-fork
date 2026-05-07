@@ -17,6 +17,22 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* glibc may define some stdio entry points as macros (fortify, gnu inline).
+ * Undefine to allow our own implementations. */
+#undef fread
+#undef fread_unlocked
+#undef fopen
+#undef fopen64
+#undef freopen
+#undef fclose
+#undef fseek
+#undef fseeko
+#undef fseeko64
+#undef ftell
+#undef ftello
+#undef ftello64
+#undef fileno
+
 #define MAX_SPECIAL_FDS 128
 #define MAX_SPECIAL_FPS 128
 #define MAX_RANGES 65536
