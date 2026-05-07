@@ -113,6 +113,9 @@ enabling_variable(lseek);
 
 
 int (*real_open)(const char *pathname, int flags, ...) = NULL;
+int (*real_open64)(const char *pathname, int flags, ...) = NULL;
+int (*real_openat)(int dirfd, const char *pathname, int flags, ...) = NULL;
+int (*real_openat64)(int dirfd, const char *pathname, int flags, ...) = NULL;
 int (*real_close)(int fd) = NULL;
 int (*real_fstat)(int fd, struct stat *statbuf) = NULL;
 int (*real_fstat64)(int fd, struct stat64 *statbuf) = NULL;
@@ -120,15 +123,21 @@ int (*real___fxstat)(int ver, int fd, struct stat *statbuf) = NULL;
 int (*real___fxstat64)(int ver, int fd, struct stat64 *statbuf) = NULL;
 ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
 ssize_t (*real_pread)(int fd, void *buf, size_t count, off_t offset) = NULL;
+ssize_t (*real_pread64)(int fd, void *buf, size_t count, off64_t offset) = NULL;
 void * (*real_mmap)(void *addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
+void * (*real_mmap64)(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) = NULL;
 int (*real_munmap)(void *addr, size_t length) = NULL;
 off_t (*real_lseek)(int fd, off_t offset, int whence) = NULL;
+off64_t (*real_lseek64)(int fd, off64_t offset, int whence) = NULL;
 
 
 void
 init_real(void)
 {
     init_real_function(open);
+    init_real_function(open64);
+    init_real_function(openat);
+    init_real_function(openat64);
     init_real_function(close);
     init_real_function(fstat);
     init_real_function(fstat64);
@@ -136,9 +145,12 @@ init_real(void)
     init_real_function(__fxstat64);
     init_real_function(read);
     init_real_function(pread);
+    init_real_function(pread64);
     init_real_function(mmap);
+    init_real_function(mmap64);
     init_real_function(munmap);
     init_real_function(lseek);
+    init_real_function(lseek64);
 
     char *il_str = getenv("INTERPOSE_LOG");
     if (il_str != NULL) {
@@ -232,7 +244,29 @@ typedef int32_t (*VCursorCellDataDirect_f)(
 static VCursorCellDataDirect_f real_VCursorCellDataDirect = NULL;
 
 static void *mmap_allocated[128];
+static size_t mmap_allocated_len[128];
 static size_t n_mmap_allocated = 0;
+
+
+static void
+clear_mmap_allocations(void)
+{
+    pthread_once(&init_once, init_real);
+    if (!real_munmap) {
+        n_mmap_allocated = 0;
+        return;
+    }
+    while (n_mmap_allocated > 0) {
+        n_mmap_allocated--;
+        void *ptr = mmap_allocated[n_mmap_allocated];
+        size_t len = mmap_allocated_len[n_mmap_allocated];
+        if (ptr) {
+            real_munmap(ptr, len);
+        }
+        mmap_allocated[n_mmap_allocated] = NULL;
+        mmap_allocated_len[n_mmap_allocated] = 0;
+    }
+}
 
 
 void
@@ -401,6 +435,7 @@ dp_walk_columns(
 void
 dp_clear_info(void)
 {
+    clear_mmap_allocations();
     dp_clear_walk_ranges();
     free(owned_accession);
     free(owned_data);
@@ -497,6 +532,21 @@ open_hook(const char *pathname, int flags)
     return -1;
 }
 
+static int
+track_special_fd(const char *pathname, int fd)
+{
+    if (!info.accession || fd < 0) return 0;
+    if (strcmp(my_basename(pathname), info.accession) != 0) return 0;
+    safe_log("[interpose] tracking special_fd\n");
+    safe_log(info.accession);
+    safe_log("\n");
+    if (sfd >= 10) return 0;
+    special_fd[sfd] = fd;
+    special_fd_offset[sfd] = 0;
+    sfd++;
+    return 1;
+}
+
 
 int
 open(const char *pathname, int flags, ...)
@@ -542,6 +592,93 @@ open(const char *pathname, int flags, ...)
                 fd = real_open(pathname, flags);
             }
         }
+    });
+    return fd;
+}
+
+int
+open64(const char *pathname, int flags, ...)
+{
+    int fd = -1;
+    mode_t mode = 0;
+    int has_mode = open_needs_mode(flags);
+    va_list ap;
+    if (has_mode) {
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    pthread_once(&init_once, init_real);
+    if (!real_open64) return -1;
+
+    if (! enable_open || ! hooks_enabled_for_thread()) {
+        return has_mode ? real_open64(pathname, flags, mode) : real_open64(pathname, flags);
+    }
+    if (in_hook) {
+        return has_mode ? real_open64(pathname, flags, mode) : real_open64(pathname, flags);
+    }
+
+    WITH_HOOK({
+        fd = has_mode ? real_open64(pathname, flags, mode) : real_open64(pathname, flags);
+        track_special_fd(pathname, fd);
+    });
+    return fd;
+}
+
+int
+openat(int dirfd, const char *pathname, int flags, ...)
+{
+    int fd = -1;
+    mode_t mode = 0;
+    int has_mode = open_needs_mode(flags);
+    va_list ap;
+    if (has_mode) {
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    pthread_once(&init_once, init_real);
+    if (!real_openat) return -1;
+
+    if (! enable_open || ! hooks_enabled_for_thread()) {
+        return has_mode ? real_openat(dirfd, pathname, flags, mode) : real_openat(dirfd, pathname, flags);
+    }
+    if (in_hook) {
+        return has_mode ? real_openat(dirfd, pathname, flags, mode) : real_openat(dirfd, pathname, flags);
+    }
+
+    WITH_HOOK({
+        fd = has_mode ? real_openat(dirfd, pathname, flags, mode) : real_openat(dirfd, pathname, flags);
+        track_special_fd(pathname, fd);
+    });
+    return fd;
+}
+
+int
+openat64(int dirfd, const char *pathname, int flags, ...)
+{
+    int fd = -1;
+    mode_t mode = 0;
+    int has_mode = open_needs_mode(flags);
+    va_list ap;
+    if (has_mode) {
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    pthread_once(&init_once, init_real);
+    if (!real_openat64) return -1;
+
+    if (! enable_open || ! hooks_enabled_for_thread()) {
+        return has_mode ? real_openat64(dirfd, pathname, flags, mode) : real_openat64(dirfd, pathname, flags);
+    }
+    if (in_hook) {
+        return has_mode ? real_openat64(dirfd, pathname, flags, mode) : real_openat64(dirfd, pathname, flags);
+    }
+
+    WITH_HOOK({
+        fd = has_mode ? real_openat64(dirfd, pathname, flags, mode) : real_openat64(dirfd, pathname, flags);
+        track_special_fd(pathname, fd);
     });
     return fd;
 }
@@ -737,10 +874,12 @@ __fxstat64(int ver, int fd, struct stat64 *statbuf)
 ssize_t
 read_from_info(void *buf, size_t count, off_t offset)
 {
-    if ((size_t)offset >= info.size) return 0;
+    if (!buf || !info.data || offset < 0) return -1;
 
     if (dp_mode == 0) {
-        size_t to_read = ((size_t)offset + count <= info.size) ? count : info.size - (size_t)offset;
+        if ((size_t)offset >= info.data_size) return 0;
+        size_t avail = info.data_size - (size_t)offset;
+        size_t to_read = count < avail ? count : avail;
         memcpy(buf, info.data + offset, to_read);
         return (ssize_t)to_read;
     }
@@ -750,10 +889,19 @@ read_from_info(void *buf, size_t count, off_t offset)
         uint64_t buf_off   = pread_ranges[3 * j + 1];
         uint64_t rng_start = pread_ranges[3 * j + 2];
         uint64_t rng_end   = pread_ranges[3 * j + 3];
-        if (rng_start <= (uint64_t)offset && (uint64_t)offset < rng_end) {
-            size_t avail = (size_t)(rng_end - (uint64_t)offset);
+        uint64_t uoff = (uint64_t)offset;
+        if (rng_start <= uoff && uoff < rng_end) {
+            uint64_t rel64 = uoff - rng_start;
+            if (buf_off > (uint64_t)SIZE_MAX || rel64 > (uint64_t)SIZE_MAX) return -1;
+            size_t rel = (size_t)rel64;
+            size_t src_off = (size_t)buf_off + rel;
+            if (src_off < (size_t)buf_off || src_off >= info.data_size) return -1;
+            size_t avail = info.data_size - src_off;
+            size_t range_avail = (size_t)(rng_end - uoff);
+            if (avail > range_avail) avail = range_avail;
             size_t to_read = count < avail ? count : avail;
-            memcpy(buf, info.data + buf_off + ((size_t)offset - (size_t)rng_start), to_read);
+            if (to_read == 0) return -1;
+            memcpy(buf, info.data + src_off, to_read);
             return (ssize_t)to_read;
         }
     }
@@ -855,6 +1003,30 @@ pread(int fd, void *buf, size_t count, off_t offset)
     return ret;
 }
 
+ssize_t
+pread64(int fd, void *buf, size_t count, off64_t offset)
+{
+    ssize_t ret = -1;
+    pthread_once(&init_once, init_real);
+    if (!real_pread64) return -1;
+
+    if (! enable_pread || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real_pread64(fd, buf, count, offset));
+        return ret;
+    }
+    if (in_hook) {
+        return real_pread64(fd, buf, count, offset);
+    }
+
+    WITH_HOOK({
+        ret = pread_hook(fd, buf, count, (off_t)offset);
+        if (ret == -1) {
+            ret = real_pread64(fd, buf, count, offset);
+        }
+    });
+    return ret;
+}
+
 off_t
 lseek_hook(int fd, off_t offset, int whence)
 {
@@ -906,6 +1078,30 @@ lseek(int fd, off_t offset, int whence)
     return ret;
 }
 
+off64_t
+lseek64(int fd, off64_t offset, int whence)
+{
+    off64_t ret = (off64_t)-1;
+    pthread_once(&init_once, init_real);
+    if (!real_lseek64) return (off64_t)-1;
+
+    if (! enable_lseek || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real_lseek64(fd, offset, whence));
+        return ret;
+    }
+    if (in_hook) {
+        return real_lseek64(fd, offset, whence);
+    }
+
+    WITH_HOOK({
+        ret = (off64_t)lseek_hook(fd, (off_t)offset, whence);
+        if (ret == (off64_t)-1) {
+            ret = real_lseek64(fd, offset, whence);
+        }
+    });
+    return ret;
+}
+
 void *
 mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
@@ -923,7 +1119,26 @@ mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             } else {
                 mmap_ranges_overflow = 1;
             }
-            return (void *)(info.data + offset);
+            void *ptr = real_mmap(NULL, length, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (ptr == MAP_FAILED) return NULL;
+            size_t to_copy = 0;
+            if (offset >= 0 && (size_t)offset < info.data_size) {
+                size_t avail = info.data_size - (size_t)offset;
+                to_copy = length < avail ? length : avail;
+            }
+            if (to_copy > 0) {
+                memcpy(ptr, info.data + offset, to_copy);
+            }
+            if (to_copy < length) {
+                memset((char *)ptr + to_copy, 0, length - to_copy);
+            }
+            if (n_mmap_allocated < 128) {
+                mmap_allocated[n_mmap_allocated] = ptr;
+                mmap_allocated_len[n_mmap_allocated] = length;
+                n_mmap_allocated++;
+            }
+            return ptr;
         } else {
             uint64_t nranges = mmap_ranges[0];
             for (uint64_t j = 0; j < nranges; j++) {
@@ -934,8 +1149,23 @@ mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
                     void *ptr = real_mmap(NULL, length, PROT_READ | PROT_WRITE,
                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                     if (ptr == MAP_FAILED) return NULL;
-                    memcpy(ptr, info.data + buf_off + ((size_t)offset - (size_t)rng_start), length);
-                    if (n_mmap_allocated < 128) mmap_allocated[n_mmap_allocated++] = ptr;
+                    size_t rel = (size_t)((uint64_t)offset - rng_start);
+                    size_t src_off = (size_t)buf_off + rel;
+                    size_t avail = src_off < info.data_size ? info.data_size - src_off : 0;
+                    size_t range_avail = rng_end > (uint64_t)offset ? (size_t)(rng_end - (uint64_t)offset) : 0;
+                    if (avail > range_avail) avail = range_avail;
+                    size_t to_copy = length < avail ? length : avail;
+                    if (to_copy > 0) {
+                        memcpy(ptr, info.data + src_off, to_copy);
+                    }
+                    if (to_copy < length) {
+                        memset((char *)ptr + to_copy, 0, length - to_copy);
+                    }
+                    if (n_mmap_allocated < 128) {
+                        mmap_allocated[n_mmap_allocated] = ptr;
+                        mmap_allocated_len[n_mmap_allocated] = length;
+                        n_mmap_allocated++;
+                    }
                     return ptr;
                 }
             }
@@ -969,25 +1199,51 @@ mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     return ret;
 }
 
+void *
+mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset)
+{
+    void *ret = NULL;
+    pthread_once(&init_once, init_real);
+    if (!real_mmap64) return NULL;
+    if (! enable_mmap || ! hooks_enabled_for_thread()) {
+        WITH_HOOK(ret = real_mmap64(addr, length, prot, flags, fd, offset));
+        return ret;
+    }
+    if (in_hook) {
+        return real_mmap64(addr, length, prot, flags, fd, offset);
+    }
+    WITH_HOOK({
+        ret = mmap_hook(addr, length, prot, flags, fd, (off_t)offset);
+        if (ret == NULL) {
+            ret = real_mmap64(addr, length, prot, flags, fd, offset);
+        }
+    });
+    return ret;
+}
+
 
 int
 munmap_hook(void *addr, size_t length)
 {
     if (sfd == 0) return -1;
+    for (size_t i = 0; i < n_mmap_allocated; i++) {
+        if (addr == mmap_allocated[i]) {
+            safe_log("[interpose] munmap_hook freeing allocated\n");
+            (void)length;
+            real_munmap(addr, mmap_allocated_len[i]);
+            mmap_allocated[i] = mmap_allocated[--n_mmap_allocated];
+            mmap_allocated_len[i] = mmap_allocated_len[n_mmap_allocated];
+            mmap_allocated[n_mmap_allocated] = NULL;
+            mmap_allocated_len[n_mmap_allocated] = 0;
+            return 0;
+        }
+    }
     if (dp_mode == 0) {
         if ((const char *)addr >= info.data && (const char *)addr < info.data + info.size) {
             safe_log("[interpose] munmap_hook no-op (mode 0)\n");
             return 0;
         }
         return -1;
-    }
-    for (size_t i = 0; i < n_mmap_allocated; i++) {
-        if (addr == mmap_allocated[i]) {
-            safe_log("[interpose] munmap_hook freeing allocated (mode 1)\n");
-            real_munmap(addr, length);
-            mmap_allocated[i] = mmap_allocated[--n_mmap_allocated];
-            return 0;
-        }
     }
     return -1;
 }

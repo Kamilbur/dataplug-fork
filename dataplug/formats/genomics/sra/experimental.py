@@ -40,6 +40,14 @@ def _vdb():
     return vdb
 
 
+def _reset_vdb():
+    global _shims_vars
+    from .internals.vdb import reset_vdb
+
+    _shims_vars = None
+    return reset_vdb()
+
+
 class FileInfo(C.Structure):
     _fields_ = (
         ("accession", C.c_char_p),
@@ -95,6 +103,10 @@ class ShimsMapping:
         """Pass `data` to the C shim without copying. `data` must outlive the
         next clear() call; we keep a strong reference here.
         """
+        if hasattr(self._lib, "_server"):
+            self.set_info(accession, data, size, offset)
+            return
+
         self._keepalive = (accession, data)
         if isinstance(data, (bytes, bytearray, memoryview)):
             buf = data if isinstance(data, bytearray) else bytearray(data)
@@ -280,6 +292,7 @@ def _walk_record_ranges_python(vcols, total_lines: int, step: int, total_size: i
 def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
                           mmaps: list, preads: dict) -> bool:
     import numpy as np
+    from .internals.cdlml_compat import cast, pointer_for, string_at
 
     lib = _vdb()["shims"]
     try:
@@ -313,7 +326,9 @@ def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
     mmap_data.restype = C.POINTER(C.c_uint64)
 
     col_idxs = (C.c_int * len(vcols.columns))(*(col.idx for col in vcols.columns))
-    rc = walk(vcols.cur, col_idxs, len(col_idxs), total_lines, step, total_size)
+    col_idxs_arg = pointer_for(col_idxs, cdll=lib) if hasattr(lib, "_server") else col_idxs
+    cur_arg = vcols.cur.value if isinstance(vcols.cur, C.c_void_p) else vcols.cur
+    rc = walk(cur_arg, col_idxs_arg, len(col_idxs), total_lines, step, total_size)
     if rc == -10:
         clear()
         return False
@@ -325,12 +340,22 @@ def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
     try:
         mc = mmap_count()
         if mc:
-            arr = np.ctypeslib.as_array(mmap_data(), shape=(mc * 2,)).reshape(-1, 2)
+            data = mmap_data()
+            if hasattr(lib, "_server"):
+                data = string_at(cast(data, C.POINTER(C.c_uint64), cdll=lib), mc * 2 * C.sizeof(C.c_uint64))
+                arr = np.frombuffer(data, dtype=np.uint64).reshape(-1, 2)
+            else:
+                arr = np.ctypeslib.as_array(data, shape=(mc * 2,)).reshape(-1, 2)
             mmaps.extend((int(row[0]), int(row[1])) for row in arr)
 
         pc = pread_count()
         if pc:
-            arr = np.ctypeslib.as_array(pread_data(), shape=(pc * 3,)).reshape(-1, 3)
+            data = pread_data()
+            if hasattr(lib, "_server"):
+                data = string_at(cast(data, C.POINTER(C.c_uint64), cdll=lib), pc * 3 * C.sizeof(C.c_uint64))
+                arr = np.frombuffer(data, dtype=np.uint64).reshape(-1, 3)
+            else:
+                arr = np.ctypeslib.as_array(data, shape=(pc * 3,)).reshape(-1, 3)
             for row in arr:
                 key = int(row[0])
                 idx = -1 if key == uint64_max else int(key)
@@ -352,6 +377,7 @@ def preprocess_sra(cloud_object: CloudObject, step=250):
 
     logger.info("Preprocessing sra started")
 
+    _reset_vdb()
     sv = _sv()
     sv["dp_mode"].value = 0
     sv["dp_sra_size"].value = cloud_object.size
