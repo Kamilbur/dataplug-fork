@@ -296,6 +296,7 @@ def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
 
     lib = _vdb()["shims"]
     try:
+        set_cell = lib.dp_set_vcursor_cell_func
         walk = lib.dp_walk_columns
         clear = lib.dp_clear_walk_ranges
         pread_count = lib.dp_walk_pread_count
@@ -305,6 +306,9 @@ def _walk_record_ranges_c(vcols, total_lines: int, step: int, total_size: int,
     except AttributeError:
         return False
 
+    set_cell.argtypes = [C.c_void_p]
+    set_cell.restype = None
+    set_cell(C.cast(_vdb().VCursorCellDataDirect, C.c_void_p))
     walk.argtypes = [
         C.c_void_p,
         C.POINTER(C.c_int),
@@ -472,6 +476,77 @@ class SRASlice(CloudObjectSlice):
 
     def lazy_get(self, split=False):
         yield from self.partial_download(split=split)
+
+    def to_file_obj(self, file_obj, split=False):
+        if split or not hasattr(file_obj, "fileno"):
+            items = 0
+            output_bytes = 0
+            for reads in self.partial_download(split=split):
+                for record in reads:
+                    written = file_obj.write(record.encode("utf-8"))
+                    output_bytes += written if isinstance(written, int) else len(record)
+                    items += 1
+            return items, output_bytes
+
+        from .internals.sra import VColumns
+
+        acc = accession(self.cloud_object)
+        raw, mmap_entries, pread_entries = _build_range_buffer(
+            self.cloud_object, self.mmaps, self.preads
+        )
+        sv = _sv()
+        sv["dp_mode"].value = 1
+        sv["dp_sra_size"].value = self.cloud_object.size
+        _fill_ranges_mode1(sv["mmap_ranges"], mmap_entries)
+        _fill_ranges_mode1(sv["pread_ranges"], pread_entries)
+
+        shims_mapping = ShimsMapping()
+        mask = EnabledMask()
+        items = C.c_uint64()
+        output_bytes = C.c_uint64()
+
+        try:
+            with mask.enabled_all(), temporary_sra(acc) as fpath:
+                shims_mapping.set_info(acc, raw, self.cloud_object.size, 0)
+                with VColumns.from_filepath(fpath) as vcols:
+                    lib = _vdb()["shims"]
+                    set_cell = lib.dp_set_vcursor_cell_func
+                    set_cell.argtypes = [C.c_void_p]
+                    set_cell.restype = None
+                    set_cell(C.cast(_vdb().VCursorCellDataDirect, C.c_void_p))
+                    write_range = lib.dp_write_fastq_range
+                    write_range.argtypes = [
+                        C.c_void_p,
+                        C.c_int,
+                        C.c_int,
+                        C.c_int,
+                        C.c_longlong,
+                        C.c_longlong,
+                        C.c_char_p,
+                        C.c_int,
+                        C.POINTER(C.c_uint64),
+                        C.POINTER(C.c_uint64),
+                    ]
+                    write_range.restype = C.c_int
+                    cols = vcols.columns
+                    rc = write_range(
+                        vcols.cur,
+                        cols[0].idx,
+                        cols[1].idx,
+                        cols[2].idx,
+                        self.start + 1,
+                        self.end,
+                        acc.encode(),
+                        file_obj.fileno(),
+                        C.byref(items),
+                        C.byref(output_bytes),
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"dp_write_fastq_range failed with rc={rc}")
+        finally:
+            sv["dp_mode"].value = 0
+            shims_mapping.clear()
+        return int(items.value), int(output_bytes.value)
 
     @staticmethod
     def sum_lengths(iterable):

@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <limits.h>
+#include <stdio.h>
 
 
 bool INTERPOSE_LOG = 0;
@@ -248,6 +249,41 @@ static size_t mmap_allocated_len[128];
 static size_t n_mmap_allocated = 0;
 
 
+void
+dp_set_vcursor_cell_func(void *fn)
+{
+    real_VCursorCellDataDirect = (VCursorCellDataDirect_f)fn;
+}
+
+
+static int
+ensure_cell_func(void)
+{
+    pthread_once(&init_once, init_real);
+    if (!real_VCursorCellDataDirect) {
+        real_VCursorCellDataDirect = (VCursorCellDataDirect_f)dlsym(
+            RTLD_DEFAULT, "VCursorCellDataDirect"
+        );
+    }
+    return real_VCursorCellDataDirect ? 0 : -1;
+}
+
+
+static int
+write_all_fd(int fd, const void *buf, size_t len, uint64_t *bytes_out)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n <= 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+        if (bytes_out) *bytes_out += (uint64_t)n;
+    }
+    return 0;
+}
+
+
 static void
 clear_mmap_allocations(void)
 {
@@ -388,13 +424,7 @@ dp_walk_columns(
     uint64_t total_size
 )
 {
-    pthread_once(&init_once, init_real);
-    if (!real_VCursorCellDataDirect) {
-        real_VCursorCellDataDirect = (VCursorCellDataDirect_f)dlsym(
-            RTLD_DEFAULT, "VCursorCellDataDirect"
-        );
-    }
-    if (!real_VCursorCellDataDirect || !cur || !col_idxs || step <= 0) {
+    if (ensure_cell_func() != 0 || !cur || !col_idxs || step <= 0) {
         return -10;
     }
 
@@ -427,6 +457,75 @@ dp_walk_columns(
         rc = drain_walk_ranges(group_idx * (uint64_t)step, total_size);
         if (rc != 0) return rc;
         group_idx++;
+    }
+    return 0;
+}
+
+
+int
+dp_write_fastq_range(
+    void *cur,
+    int read_col,
+    int qual_col,
+    int name_col,
+    int64_t row_start,
+    int64_t row_end,
+    const char *accession,
+    int fd,
+    uint64_t *items_out,
+    uint64_t *bytes_out
+)
+{
+    if (items_out) *items_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (ensure_cell_func() != 0 || !cur || !accession || fd < 0 || row_end < row_start) {
+        return -10;
+    }
+
+    for (int64_t row_idx = row_start; row_idx <= row_end; row_idx++) {
+        uint32_t elem_bits = 0;
+        const void *read_data = NULL;
+        const void *qual_data = NULL;
+        const void *name_data = NULL;
+        uint32_t read_len = 0;
+        uint32_t qual_len = 0;
+        uint32_t name_len = 0;
+        int rc = real_VCursorCellDataDirect(cur, row_idx, (uint32_t)read_col,
+                                            &elem_bits, &read_data, NULL, &read_len);
+        if (rc != 0) return rc;
+        rc = real_VCursorCellDataDirect(cur, row_idx, (uint32_t)qual_col,
+                                        &elem_bits, &qual_data, NULL, &qual_len);
+        if (rc != 0) return rc;
+        rc = real_VCursorCellDataDirect(cur, row_idx, (uint32_t)name_col,
+                                        &elem_bits, &name_data, NULL, &name_len);
+        if (rc != 0) return rc;
+
+        int header_len = snprintf(NULL, 0, "%s.%lld %.*s length=%u",
+                                  accession, (long long)row_idx,
+                                  (int)name_len, (const char *)name_data,
+                                  read_len);
+        if (header_len < 0) return -20;
+        char *header = malloc((size_t)header_len + 1);
+        if (!header) return -21;
+        snprintf(header, (size_t)header_len + 1, "%s.%lld %.*s length=%u",
+                 accession, (long long)row_idx,
+                 (int)name_len, (const char *)name_data,
+                 read_len);
+
+        if (write_all_fd(fd, "@", 1, bytes_out) != 0 ||
+            write_all_fd(fd, header, (size_t)header_len, bytes_out) != 0 ||
+            write_all_fd(fd, "\n", 1, bytes_out) != 0 ||
+            write_all_fd(fd, read_data, read_len, bytes_out) != 0 ||
+            write_all_fd(fd, "\n+", 2, bytes_out) != 0 ||
+            write_all_fd(fd, header, (size_t)header_len, bytes_out) != 0 ||
+            write_all_fd(fd, "\n", 1, bytes_out) != 0 ||
+            write_all_fd(fd, qual_data, qual_len, bytes_out) != 0 ||
+            write_all_fd(fd, "\n", 1, bytes_out) != 0) {
+            free(header);
+            return -22;
+        }
+        free(header);
+        if (items_out) (*items_out)++;
     }
     return 0;
 }
