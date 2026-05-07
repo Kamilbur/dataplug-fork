@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from cdlml import get_var
+from cdlml import addressof, get_var, memmove
 
 from dataplug.entities import CloudDataFormat, CloudObjectSlice, PartitioningStrategy
 from dataplug.preprocessing.metadata import PreprocessingMetadata
@@ -51,9 +51,9 @@ class ShimsMapping:
 
     @info.setter
     def info(self, value):
-        dst = C.addressof(self._info)
-        src = C.addressof(value)
-        C.memmove(dst, src, C.sizeof(FileInfo))
+        dst = addressof(self._info)
+        src = addressof(value)
+        memmove(dst, src, C.sizeof(FileInfo))
         self._keepalive = value
 
 
@@ -191,7 +191,7 @@ def _ensure_read_range(reads: dict[int, list[Interval]], idx: int, size: int) ->
 
 
 def preprocess_mgb(cloud_object: CloudObject, threads: int = 1):
-    from .internals.genie import access_unit_count, decompress_access_unit
+    from .internals.genie import access_unit_count, scan_access_unit
 
     logger.info("Preprocessing mgb started")
     sv = _sv()
@@ -214,7 +214,7 @@ def preprocess_mgb(cloud_object: CloudObject, threads: int = 1):
             num_access_units = access_unit_count(fpath)
             _save_reads(reads, -1)
             for access_unit_id in range(num_access_units):
-                decompress_access_unit(
+                scan_access_unit(
                     fpath,
                     access_unit_id,
                     working_dir=workdir,
