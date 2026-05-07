@@ -5,7 +5,6 @@ import concurrent.futures
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import io
-import importlib
 import logging
 import multiprocessing as mp
 import os
@@ -29,7 +28,22 @@ logger = logging.getLogger(__name__)
 
 MAX_RANGES = 65536
 _RangesArray = C.c_uint64 * (1 + MAX_RANGES * 3)
-_SYSCALLS = ["open", "open64", "close", "fstat", "fstat64", "read", "lseek", "lseek64"]
+_SYSCALLS = [
+    "open",
+    "open64",
+    "openat",
+    "openat64",
+    "close",
+    "fstat",
+    "fstat64",
+    "read",
+    "pread",
+    "pread64",
+    "mmap",
+    "mmap64",
+    "lseek",
+    "lseek64",
+]
 
 
 def _shims():
@@ -216,17 +230,21 @@ def _fastq_records(data: bytes):
         yield ("\n".join(record_lines) + "\n",)
 
 
+def _select_fastq_records(data: bytes, start: int, end: int):
+    for idx, record in enumerate(_fastq_records(data)):
+        if idx < start:
+            continue
+        if idx >= end:
+            break
+        yield record
+
+
 def _fastq_record_sort_key(record_lines: list[str]):
     read_name = record_lines[0].split()[0]
     try:
         return (0, int(read_name.rsplit(".", 1)[1]))
     except (IndexError, ValueError):
         return (1, read_name)
-
-
-def _ensure_read_range(reads: dict[int, list[Interval]], idx: int, size: int) -> None:
-    if idx not in reads:
-        reads[idx] = [(0, size)]
 
 
 def _mgb_default_map_workers() -> int:
@@ -242,17 +260,21 @@ def _mgb_map_worker_count(map_workers: int | None, num_access_units: int) -> int
 
 def _mgb_default_start_method() -> str:
     methods = mp.get_all_start_methods()
-    if "fork" in methods:
-        return "fork"
+    if "spawn" in methods:
+        return "spawn"
     return methods[0]
+
+
+def _mgb_can_spawn() -> bool:
+    import __main__
+
+    main_file = getattr(__main__, "__file__", "")
+    return bool(main_file and Path(main_file).exists())
 
 
 def _scan_mgb_access_unit_worker(args):
     fpath, file_name, size, access_unit_id, threads, workdir = args
     global _shims_vars
-    from .internals import genie as genie_module
-
-    importlib.reload(genie_module)
     _shims_vars = None
 
     from .internals.genie import scan_access_unit
@@ -291,6 +313,16 @@ def _map_mgb_access_units(
     start_method: str,
 ) -> dict[int, list[Interval]]:
     reads: dict[int, list[Interval]] = {}
+    if start_method == "fork" and map_workers > 1:
+        raise RuntimeError(
+            "parallel MGB preprocessing cannot use fork safely with GENIE/cdlml; "
+            "use map_start_method='spawn' or map_workers=1"
+        )
+    if start_method == "spawn" and map_workers > 1 and not _mgb_can_spawn():
+        raise RuntimeError(
+            "parallel MGB preprocessing with spawn requires an importable __main__ file; "
+            "run from a Python script/module or use map_workers=1"
+        )
     logger.info(
         "Mapping %d MGB access units with %d process(es)",
         num_access_units,
@@ -301,6 +333,30 @@ def _map_mgb_access_units(
         (fpath, file_name, size, access_unit_id, threads, workdir)
         for access_unit_id in range(num_access_units)
     ]
+    if map_workers == 1:
+        for task in tasks:
+            access_unit_id = task[3]
+            _, intervals, fastq_size = _scan_mgb_access_unit_worker(task)
+            if not intervals:
+                raise RuntimeError(
+                    "MGB preprocessing captured no byte intervals for access unit "
+                    f"{access_unit_id + 1}/{num_access_units}"
+                )
+            reads[access_unit_id] = intervals
+            logger.info(
+                "Mapped MGB access unit %d/%d to %d byte range(s)",
+                access_unit_id + 1,
+                num_access_units,
+                len(intervals),
+            )
+            logger.debug(
+                "MGB access unit %d/%d produced %d FASTQ byte(s)",
+                access_unit_id + 1,
+                num_access_units,
+                fastq_size,
+            )
+        return reads
+
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=map_workers,
         mp_context=ctx,
@@ -317,22 +373,28 @@ def _map_mgb_access_units(
 
         for future in concurrent.futures.as_completed(future_to_au):
             access_unit_id = future_to_au[future]
-            _, intervals, fastq_size = future.result()
-            if intervals:
-                reads[access_unit_id] = intervals
-                logger.info(
-                    "Mapped MGB access unit %d/%d to %d byte range(s)",
-                    access_unit_id + 1,
-                    num_access_units,
-                    len(intervals),
+            try:
+                _, intervals, fastq_size = future.result()
+            except concurrent.futures.process.BrokenProcessPool as exc:
+                raise RuntimeError(
+                    "MGB access-unit worker died while mapping "
+                    f"{access_unit_id + 1}/{num_access_units}. "
+                    "This usually means a native GENIE/cdlml crash in the child process. "
+                    "Use map_start_method='spawn' and verify the script is the updated "
+                    "benchmark wrapper."
+                ) from exc
+            if not intervals:
+                raise RuntimeError(
+                    "MGB preprocessing captured no byte intervals for access unit "
+                    f"{access_unit_id + 1}/{num_access_units}"
                 )
-            else:
-                reads[access_unit_id] = [(0, size)]
-                logger.info(
-                    "Mapped MGB access unit %d/%d using full-object fallback",
-                    access_unit_id + 1,
-                    num_access_units,
-                )
+            reads[access_unit_id] = intervals
+            logger.info(
+                "Mapped MGB access unit %d/%d to %d byte range(s)",
+                access_unit_id + 1,
+                num_access_units,
+                len(intervals),
+            )
             logger.debug(
                 "MGB access unit %d/%d produced %d FASTQ byte(s)",
                 access_unit_id + 1,
@@ -348,53 +410,42 @@ def preprocess_mgb(
     map_workers: int | None = None,
     map_start_method: str | None = None,
 ):
-    from .internals.genie import access_unit_count
+    from .internals.genie import access_unit_count, access_unit_info
 
     logger.info("Preprocessing mgb started")
-    sv = _sv()
-    sv["dp_mode"].value = 0
-    sv["read_ranges"][0] = 0
 
     file_name = filename(cloud_object)
-    name_c = C.c_char_p(file_name.encode())
+    with temporary_mgb_from_cloud_object(file_name, cloud_object) as (fpath, _workdir):
+        num_access_units = access_unit_count(fpath)
+        logger.info("MGB has %d access units to map", num_access_units)
+        raw_reads, read_counts = access_unit_info(fpath)
+        reads = {
+            access_unit_id: merge_intervals(intervals)
+            for access_unit_id, intervals in raw_reads.items()
+        }
 
-    shims_mapping = ShimsMapping()
-    mask = EnabledMask()
-    reads: dict[int, list[Interval]] = {}
-
-    try:
-        with mask.enabled_all(), temporary_mgb_from_cloud_object(file_name, cloud_object) as (fpath, workdir):
-            shims_mapping.info = FileInfo(name_c, None, cloud_object.size)
-            num_access_units = access_unit_count(fpath)
-            logger.info("MGB has %d access units to map", num_access_units)
-            _save_reads(reads, -1)
-            worker_count = _mgb_map_worker_count(map_workers, num_access_units)
-            start_method = (
-                map_start_method
-                or os.getenv("DATAPLUG_MGB_MAP_START_METHOD")
-                or _mgb_default_start_method()
-            )
-            reads.update(
-                _map_mgb_access_units(
-                    fpath,
-                    file_name,
-                    cloud_object.size,
-                    num_access_units,
-                    threads,
-                    workdir,
-                    worker_count,
-                    start_method,
-                )
-            )
-    finally:
-        sv["dp_mode"].value = 0
-        shims_mapping.clear()
+    missing = [idx for idx in range(num_access_units) if not reads.get(idx)]
+    if missing:
+        raise RuntimeError(
+            "MGB preprocessing captured no byte intervals for access unit(s): "
+            + ", ".join(str(idx + 1) for idx in missing[:10])
+        )
+    if not reads:
+        raise RuntimeError("MGB preprocessing captured no byte intervals")
+    missing_counts = [idx for idx in range(num_access_units) if idx not in read_counts]
+    if missing_counts:
+        raise RuntimeError(
+            "MGB preprocessing captured no read counts for access unit(s): "
+            + ", ".join(str(idx + 1) for idx in missing_counts[:10])
+        )
 
     return PreprocessingMetadata(
         metadata=io.BytesIO(b"nempty"),
         attributes={
             "access_units": num_access_units,
+            "total_lines": sum(read_counts.values()),
             "reads": reads,
+            "read_counts": read_counts,
         },
     )
 
@@ -402,23 +453,38 @@ def preprocess_mgb(
 @CloudDataFormat(preprocessing_function=preprocess_mgb)
 class MGB:
     access_units: int
+    total_lines: int
     reads: dict[int, list[Interval]]
+    read_counts: dict[int, int]
 
 
 @dataclass
 class Mapping:
     reads: dict[int, list[Interval]] = field(default_factory=dict)
+    read_counts: dict[int, int] = field(default_factory=dict)
 
     @classmethod
     def from_cloud_object(cls, cloud_object: CloudObject) -> Mapping:
-        return cls(reads=cloud_object.get_attribute("reads"))
+        return cls(
+            reads=cloud_object.get_attribute("reads"),
+            read_counts=cloud_object.get_attribute("read_counts"),
+        )
 
 
 class MGBSlice(CloudObjectSlice):
-    def __init__(self, start: int, end: int, reads: list[Interval], *args, **kwargs):
+    def __init__(
+        self,
+        start: int,
+        end: int,
+        reads: list[Interval],
+        access_units: list[tuple[int, int, int]],
+        *args,
+        **kwargs,
+    ):
         self.start = start
         self.end = end
         self.reads = reads
+        self.access_units = access_units
         super().__init__(*args, **kwargs)
 
     def partial_download(self, threads: int = 1):
@@ -428,7 +494,16 @@ class MGBSlice(CloudObjectSlice):
         raw, entries = _build_range_buffer(self.cloud_object, self.reads)
         with temporary_mgb(file_name, self.cloud_object.size) as (fpath, workdir):
             _write_ranges(fpath, raw, entries)
-            for access_unit_id in range(self.start, self.end):
+            for access_unit_id, au_start, au_end in self.access_units:
+                local_start = max(self.start, au_start) - au_start
+                local_end = min(self.end, au_end) - au_start
+                logger.info(
+                    "Decoding MGB access unit %d/%d for slice records [%d, %d)",
+                    access_unit_id + 1,
+                    self.cloud_object.get_attribute("access_units"),
+                    self.start,
+                    self.end,
+                )
                 output_file = Path(workdir) / f"access_unit_{access_unit_id}.fastq"
                 decompress_access_unit_to_file(
                     fpath,
@@ -439,7 +514,7 @@ class MGBSlice(CloudObjectSlice):
                 )
                 data = output_file.read_bytes()
                 output_file.unlink()
-                yield from _fastq_records(data)
+                yield from _select_fastq_records(data, local_start, local_end)
 
     def get(self, threads: int = 1):
         return list(self.partial_download(threads=threads))
@@ -450,18 +525,32 @@ class MGBSlice(CloudObjectSlice):
 
 def generate_slices(mapping: Mapping, ranges: list[Interval]) -> list[MGBSlice]:
     reads = {int(key): list(value) for key, value in mapping.reads.items()}
+    read_counts = {int(key): int(value) for key, value in mapping.read_counts.items()}
     global_reads = reads.pop(-1, [])
+    access_unit_ranges = {}
+    pos = 0
+    for access_unit_id in sorted(read_counts):
+        next_pos = pos + read_counts[access_unit_id]
+        access_unit_ranges[access_unit_id] = (pos, next_pos)
+        pos = next_pos
+
     slices = []
     for start, end in ranges:
         intervals = list(global_reads)
-        for access_unit_id in range(start, end):
+        access_units = []
+        for access_unit_id, (au_start, au_end) in access_unit_ranges.items():
+            if au_start >= end:
+                break
+            if au_end <= start:
+                continue
             intervals.extend(reads.get(access_unit_id, []))
-        slices.append(MGBSlice(start, end, merge_intervals(intervals)))
+            access_units.append((access_unit_id, au_start, au_end))
+        slices.append(MGBSlice(start, end, merge_intervals(intervals), access_units))
     return slices
 
 
 @PartitioningStrategy(dataformat=MGB)
 def partition_chunks_strategy(cloud_object: CloudObject, num_chunks: int) -> list[MGBSlice]:
     logger.info("MGB partitioning started")
-    total = int(cloud_object.get_attribute("access_units"))
+    total = int(cloud_object.get_attribute("total_lines"))
     return generate_slices(Mapping.from_cloud_object(cloud_object), partition_dry(total, num_chunks))
