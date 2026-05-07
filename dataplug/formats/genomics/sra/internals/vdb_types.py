@@ -2,8 +2,8 @@ import ctypes as C
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .cdlml_compat import byref, cast
-from .vdb import vdb
+from .cdlml_compat import byref, cast, string_at
+from . import vdb as vdb_module
 
 
 def to_char_p(s):
@@ -77,6 +77,7 @@ class VColumn:
             self.name = name
 
     def update(self):
+        vdb = vdb_module.vdb
         vdb.VCursorDatatype(self.cur, self.idx, byref(self.tdec, vdb), byref(self.tdes, vdb))
         (dict, dflt) = type_xf[self.tdes.domain]
         self.column_type = dict[self.tdes.bits]
@@ -84,32 +85,36 @@ class VColumn:
             self.column_type = dflt
 
     def read(self, row):
+        vdb = vdb_module.vdb
         row_id = C.c_longlong(row)
         elem_bits = C.c_int()
         data = C.c_void_p()
         row_len = C.c_int()
         vdb.VCursorCellDataDirect(
             self.cur,
-            row_id,
+            row_id.value,
             self.idx,
             byref(elem_bits, vdb),
             byref(data, vdb),
-            None,
+            0,
             byref(row_len, vdb),
         )
         if self.column_type == C.c_char:
-            tmp = C.string_at(data, row_len.value)
+            tmp = string_at(cast(data.value or 0, C.POINTER(C.c_char), vdb), row_len.value)
             if isinstance(tmp, bytes):
                 return tmp.decode("utf-8")
             return tmp
-        typed_ptr = cast(data, C.POINTER(self.column_type), vdb)
         e_count = row_len.value
         if elem_bits.value < 8:
             e_count *= elem_bits.value
             e_count //= 8
-        return [typed_ptr[idx] for idx in range(e_count)]
+        typed_ptr = cast(data.value or 0, C.POINTER(self.column_type), vdb)
+        raw = string_at(typed_ptr, e_count * C.sizeof(self.column_type))
+        arr_type = self.column_type * e_count
+        return list(arr_type.from_buffer_copy(raw))
 
     def row_range(self):
+        vdb = vdb_module.vdb
         first = C.c_longlong()
         count = C.c_longlong()
         vdb.VCursorIdRange(self.cur, self.idx, byref(first, vdb), byref(count, vdb))

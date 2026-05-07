@@ -1,7 +1,7 @@
 import contextlib
 import ctypes as C
 
-from .vdb import vdb
+from . import vdb as vdb_module
 from .cdlml_compat import byref
 from .vdb_types import to_char_p
 
@@ -18,6 +18,7 @@ _COLUMN_NAMES = (
 
 
 def _release(name, handle):
+    vdb = vdb_module.vdb
     if handle is not None and _handle_value(handle):
         with contextlib.suppress(Exception):
             getattr(vdb, name)(_handle_value(handle))
@@ -30,6 +31,7 @@ def _handle_value(handle):
 
 
 def _open_table(mgr, path):
+    vdb = vdb_module.vdb
     tab = C.c_void_p()
     if vdb.VDBManagerOpenTableRead(_handle_value(mgr), byref(tab, vdb), 0, to_char_p(path)) == 0:
         return tab, None
@@ -43,6 +45,7 @@ def _open_table(mgr, path):
 
 
 def _open_cursor(path):
+    vdb = vdb_module.vdb
     nat_dir = C.c_void_p()
     mgr = C.c_void_p()
     cur = C.c_void_p()
@@ -57,6 +60,7 @@ class VColumns:
     def __init__(self, handles):
         from .vdb_types import VColumn
 
+        vdb = vdb_module.vdb
         cur, tab, db, mgr, nat_dir = handles
         self.cur = cur
         self._tab = tab

@@ -45,10 +45,27 @@ def addressof(obj):
 
 
 def byref(obj, cdll=None):
+    fn = getattr(cdlml, "byref", None)
+    if fn is not None and cdll is not None:
+        try:
+            result = fn(obj, cdll=cdll)
+        except TypeError:
+            pass
+        else:
+            if hasattr(result, "_addr") or not _is_carg(result):
+                return result
     return _contextual("byref", obj, cdll=cdll)
 
 
 def cast(obj, typ, cdll=None):
+    fn = getattr(cdlml, "cast", None)
+    if fn is not None and cdll is not None:
+        try:
+            result = fn(obj, typ, cdll=cdll)
+        except TypeError:
+            pass
+        else:
+            return result
     try:
         return _contextual("cast", obj, typ, cdll=cdll)
     except TypeError:
@@ -73,6 +90,20 @@ def memset(dst, value, size):
 
 def pointer(obj):
     return _func("pointer")(obj)
+
+
+def pointer_for(obj, cdll=None):
+    fn = getattr(cdlml, "pointer", None)
+    if fn is not None and cdll is not None:
+        try:
+            return fn(obj, cdll=cdll)
+        except TypeError:
+            pass
+    return pointer(obj)
+
+
+def string_at(ptr, size=-1):
+    return _func("string_at")(ptr, size)
 
 
 def sizeof(obj):
