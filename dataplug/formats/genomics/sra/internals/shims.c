@@ -249,6 +249,27 @@ static size_t mmap_allocated_len[128];
 static size_t n_mmap_allocated = 0;
 
 
+static void
+clear_mmap_allocations(void)
+{
+    pthread_once(&init_once, init_real);
+    if (!real_munmap) {
+        n_mmap_allocated = 0;
+        return;
+    }
+    while (n_mmap_allocated > 0) {
+        n_mmap_allocated--;
+        void *ptr = mmap_allocated[n_mmap_allocated];
+        size_t len = mmap_allocated_len[n_mmap_allocated];
+        if (ptr) {
+            real_munmap(ptr, len);
+        }
+        mmap_allocated[n_mmap_allocated] = NULL;
+        mmap_allocated_len[n_mmap_allocated] = 0;
+    }
+}
+
+
 void
 dp_set_vcursor_cell_func(void *fn)
 {
